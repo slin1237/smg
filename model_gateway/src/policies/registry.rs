@@ -365,6 +365,27 @@ impl PolicyRegistry {
         }
     }
 
+    /// Remove a worker from PD cache-aware policies if applicable
+    /// This should be called when a prefill or decode worker is being removed
+    pub fn remove_worker_from_pd_cache_aware(&self, worker_url: &str) {
+        for (worker_type, policy) in [
+            ("prefill", self.prefill_policy.get()),
+            ("decode", self.decode_policy.get()),
+        ] {
+            if let Some(policy) = policy {
+                if policy.name() == "cache_aware" {
+                    if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                        cache_aware.remove_worker_by_url(worker_url);
+                        debug!(
+                            "Removed worker {} from {} cache-aware policy",
+                            worker_url, worker_type
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Initialize cache-aware policies for PD mode (prefill and decode) - lock-free
     pub fn init_pd_cache_aware_policies(
         &self,
@@ -436,7 +457,36 @@ impl std::fmt::Debug for PolicyRegistry {
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::worker::HealthCheckConfig;
+
     use super::*;
+    use crate::{
+        policies::{CacheAwareConfig, SelectWorkerInfo},
+        worker::{BasicWorkerBuilder, Worker, WorkerType},
+    };
+
+    fn no_health_check() -> HealthCheckConfig {
+        HealthCheckConfig {
+            disable_health_check: true,
+            ..Default::default()
+        }
+    }
+
+    fn worker(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    fn cache_aware_policy() -> Arc<dyn LoadBalancingPolicy> {
+        Arc::new(CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        }))
+    }
 
     #[test]
     fn test_policy_registry_basic() {
@@ -496,5 +546,43 @@ mod tests {
         // Get default directly
         let default = registry.get_default_policy();
         assert_eq!(default.name(), "round_robin");
+    }
+
+    #[test]
+    fn test_pd_cache_aware_policy_initialization() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry.set_prefill_policy(cache_aware_policy());
+        registry.set_decode_policy(cache_aware_policy());
+
+        let prefill_workers = vec![
+            worker("http://prefill-1:8000", WorkerType::Prefill),
+            worker("http://prefill-2:8000", WorkerType::Prefill),
+        ];
+        let decode_workers = vec![
+            worker("http://decode-1:8000", WorkerType::Decode),
+            worker("http://decode-2:8000", WorkerType::Decode),
+        ];
+
+        registry.init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
+
+        let prefill_policy = registry.get_prefill_policy();
+        let decode_policy = registry.get_decode_policy();
+        let info = SelectWorkerInfo {
+            request_text: Some("shared prefix request"),
+            ..Default::default()
+        };
+
+        let prefill_first = prefill_policy.select_worker(&prefill_workers, &info);
+        let prefill_second = prefill_policy.select_worker(&prefill_workers, &info);
+        assert!(prefill_first.is_some());
+        assert_eq!(prefill_first, prefill_second);
+
+        let decode_first = decode_policy.select_worker(&decode_workers, &info);
+        let decode_second = decode_policy.select_worker(&decode_workers, &info);
+        assert!(decode_first.is_some());
+        assert_eq!(decode_first, decode_second);
+
+        registry.remove_worker_from_pd_cache_aware("http://prefill-1:8000");
+        registry.remove_worker_from_pd_cache_aware("http://decode-1:8000");
     }
 }

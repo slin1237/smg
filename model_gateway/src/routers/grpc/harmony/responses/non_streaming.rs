@@ -248,9 +248,19 @@ async fn execute_with_mcp_loop(
                         Arc::new(response_request),
                     );
 
-                    // Mark as completed with incomplete_details
-                    response.status = ResponseStatus::Completed;
-                    response.incomplete_details = Some(json!({ "reason": "max_tool_calls" }));
+                    // Tool-call limit reached before executing the remaining
+                    // calls: this is an aborted run, not a successful answer.
+                    // Per the design, exhausting `max_tool_calls` is a `failed`
+                    // status with an `error` payload (truncation
+                    // `incomplete_details` is reserved for `max_output_tokens` /
+                    // `content_filter`).
+                    response.status = ResponseStatus::Failed;
+                    response.error = Some(json!({
+                        "code": "max_tool_calls_exceeded",
+                        "message": format!(
+                            "Reached the max_tool_calls limit ({effective_limit}) before executing the remaining tool calls."
+                        ),
+                    }));
 
                     // Inject MCP metadata if any calls were executed
                     if mcp_tracking.total_calls() > 0 {

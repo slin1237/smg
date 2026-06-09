@@ -10,16 +10,18 @@
 //! - `ResponsesResponseBuilder::copy_from_request` propagates `background`
 //!   and `conversation` from the request.
 //! - `ResponsesResponse::is_incomplete()` reports the new status.
-//!
-//! Intentionally out of scope (deferred to later PRs):
-//! - Strict typing of `incomplete_details` (still `Option<Value>`).
-//! - Any change to the `validate_responses_cross_parameters` validator.
+//! - `incomplete_details` is strictly typed as `{ reason: <enum> }` with
+//!   `reason ∈ { max_output_tokens, content_filter }`.
+//! - `validate_responses_cross_parameters` accepts `background + stream` and
+//!   enforces `background ⇒ store`.
 
 use openai_protocol::responses::{
-    ResponseInputOutputItem, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
-    ResponsesRequest, ResponsesResponse, SummaryTextContent,
+    IncompleteDetails, IncompleteReason, ResponseInputOutputItem, ResponseOutputItem,
+    ResponseReasoningContent, ResponseStatus, ResponsesRequest, ResponsesResponse,
+    SummaryTextContent,
 };
 use serde_json::json;
+use validator::Validate;
 
 // ---------------------------------------------------------------------------
 // ResponseStatus::Incomplete
@@ -193,4 +195,153 @@ fn is_incomplete_helper() {
     assert!(resp.is_incomplete());
     assert!(!resp.is_complete());
     assert!(!resp.is_failed());
+}
+
+// ---------------------------------------------------------------------------
+// Typed incomplete_details: { reason: max_output_tokens | content_filter }
+// ---------------------------------------------------------------------------
+
+#[test]
+fn incomplete_reason_serializes_snake_case() {
+    assert_eq!(
+        serde_json::to_string(&IncompleteReason::MaxOutputTokens).expect("serialize"),
+        "\"max_output_tokens\""
+    );
+    assert_eq!(
+        serde_json::to_string(&IncompleteReason::ContentFilter).expect("serialize"),
+        "\"content_filter\""
+    );
+
+    let back: IncompleteReason =
+        serde_json::from_str("\"content_filter\"").expect("deserialize content_filter");
+    assert_eq!(back, IncompleteReason::ContentFilter);
+}
+
+#[test]
+fn incomplete_reason_rejects_unknown_value() {
+    // The enum is strictly `{ max_output_tokens, content_filter }`; anything
+    // else (e.g. the runtime's former `max_tool_calls`) must not deserialize.
+    let err = serde_json::from_str::<IncompleteReason>("\"max_tool_calls\"");
+    assert!(err.is_err(), "max_tool_calls must not be a valid reason");
+}
+
+#[test]
+fn incomplete_details_round_trips_typed_form() {
+    // Wire shape must remain `{ "incomplete_details": { "reason": "..." } }`.
+    let resp = ResponsesResponse::builder("resp_xyz", "gpt-5.4")
+        .status(ResponseStatus::Incomplete)
+        .incomplete_details(IncompleteDetails {
+            reason: IncompleteReason::MaxOutputTokens,
+        })
+        .build();
+
+    let v = serde_json::to_value(&resp).expect("serialize");
+    assert_eq!(
+        v["incomplete_details"],
+        json!({ "reason": "max_output_tokens" })
+    );
+
+    let back: ResponsesResponse = serde_json::from_value(v).expect("deserialize");
+    let details = back.incomplete_details.expect("incomplete_details present");
+    assert_eq!(details.reason, IncompleteReason::MaxOutputTokens);
+}
+
+#[test]
+fn incomplete_details_omitted_when_unset() {
+    // `ResponsesResponse` uses `skip_serializing_none`, so a `None`
+    // `incomplete_details` must be omitted from the wire output.
+    let resp = ResponsesResponse::builder("resp_xyz", "gpt-5.4")
+        .status(ResponseStatus::Completed)
+        .build();
+
+    let v = serde_json::to_value(&resp).expect("serialize");
+    assert!(
+        !v.as_object()
+            .expect("object")
+            .contains_key("incomplete_details"),
+        "incomplete_details must be omitted when None"
+    );
+    assert!(resp.incomplete_details.is_none());
+}
+
+#[test]
+fn incomplete_details_deserializes_from_wire_object() {
+    // A standalone object payload (as emitted by OpenAI) deserializes.
+    let details: IncompleteDetails =
+        serde_json::from_value(json!({ "reason": "content_filter" })).expect("deserialize");
+    assert_eq!(details.reason, IncompleteReason::ContentFilter);
+}
+
+// ---------------------------------------------------------------------------
+// validate_responses_cross_parameters: background + stream / background ⇒ store
+// ---------------------------------------------------------------------------
+
+#[test]
+fn background_with_stream_is_valid() {
+    // Per the design, `background=true` + `stream=true` is a valid combination
+    // (streaming background create sources its SSE from the persisted log).
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "gpt-5.4",
+        "input": "hello",
+        "background": true,
+        "stream": true,
+    }))
+    .expect("deserialize");
+
+    request
+        .validate()
+        .expect("background + stream must validate");
+}
+
+#[test]
+fn background_with_explicit_store_false_is_rejected() {
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "gpt-5.4",
+        "input": "hello",
+        "background": true,
+        "store": false,
+    }))
+    .expect("deserialize");
+
+    let err = request
+        .validate()
+        .expect_err("background + store=false must fail validation");
+    assert!(
+        format!("{err:?}").contains("background_requires_store"),
+        "expected background_requires_store, got: {err:?}"
+    );
+}
+
+#[test]
+fn background_with_explicit_store_true_is_valid() {
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "gpt-5.4",
+        "input": "hello",
+        "background": true,
+        "store": true,
+    }))
+    .expect("deserialize");
+
+    request
+        .validate()
+        .expect("background + store=true must validate");
+}
+
+#[test]
+fn background_with_default_store_is_valid() {
+    // `store` is omitted here. The request defaults `store` to `Some(true)`
+    // during `apply_defaults`, but the raw deserialized request leaves it
+    // `None` — and a `None` store must NOT trip the `background ⇒ store`
+    // check (only an explicit `store=false` should).
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "gpt-5.4",
+        "input": "hello",
+        "background": true,
+    }))
+    .expect("deserialize");
+    assert_eq!(request.store, None, "store should be None before defaults");
+
+    request
+        .validate()
+        .expect("background with default store must validate");
 }

@@ -22,7 +22,7 @@ pub struct ResponsesResponseBuilder {
     conversation: Option<String>,
     status: ResponseStatus,
     error: Option<Value>,
-    incomplete_details: Option<Value>,
+    incomplete_details: Option<IncompleteDetails>,
     instructions: Option<String>,
     max_output_tokens: Option<u32>,
     model: String,
@@ -157,8 +157,8 @@ impl ResponsesResponseBuilder {
         self
     }
 
-    /// Set incomplete details (if response was truncated)
-    pub fn incomplete_details(mut self, details: Value) -> Self {
+    /// Set incomplete details (if the response reached `incomplete` status)
+    pub fn incomplete_details(mut self, details: IncompleteDetails) -> Self {
         self.incomplete_details = Some(details);
         self
     }

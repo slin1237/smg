@@ -2615,6 +2615,31 @@ pub enum ResponseStatus {
     Cancelled,
 }
 
+/// Why a response stopped before producing complete output.
+///
+/// Mirrors OpenAI's `incomplete_details.reason`: reserved strictly for the two
+/// truncation semantics. Any other stop condition (wall-clock timeout,
+/// `max_tool_calls` exhaustion, provider errors) is surfaced as a `failed`
+/// status with an `error` payload instead.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum IncompleteReason {
+    /// Output was truncated because it hit `max_output_tokens`.
+    MaxOutputTokens,
+    /// Output was truncated by the content filter.
+    ContentFilter,
+}
+
+/// Structured detail attached to a response whose status is `incomplete`.
+///
+/// Wire shape: `{ "reason": "max_output_tokens" | "content_filter" }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct IncompleteDetails {
+    /// The reason the response is incomplete.
+    pub reason: IncompleteReason,
+}
+
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReasoningInfo {
@@ -3325,10 +3350,16 @@ fn validate_responses_cross_parameters(request: &ResponsesRequest) -> Result<(),
         }
     }
 
-    // 3. Validate background/stream conflict
-    if request.background == Some(true) && request.stream == Some(true) {
-        let mut e = ValidationError::new("background_conflicts_with_stream");
-        e.message = Some("Cannot use background mode with streaming".into());
+    // 3. Validate background requires store.
+    //
+    // `background=true` requires the response to be persisted so it can be
+    // polled/resumed/cancelled. `store` defaults to `true` (applied later in
+    // `apply_defaults`), so only an explicit `store=false` is a conflict.
+    // Note: `background=true` WITH `stream=true` is valid (streaming background
+    // create sources its SSE from the persisted event log), so it is allowed.
+    if request.background == Some(true) && request.store == Some(false) {
+        let mut e = ValidationError::new("background_requires_store");
+        e.message = Some("Background mode requires store=true".into());
         return Err(e);
     }
 
@@ -3652,8 +3683,8 @@ pub struct ResponsesResponse {
     /// Error information if status is failed
     pub error: Option<Value>,
 
-    /// Incomplete details if response was truncated
-    pub incomplete_details: Option<Value>,
+    /// Incomplete details if the response was truncated (`incomplete` status).
+    pub incomplete_details: Option<IncompleteDetails>,
 
     /// System instructions used
     pub instructions: Option<String>,

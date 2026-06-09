@@ -928,29 +928,54 @@ fn test_validate_top_logprobs_requires_include() {
     );
 }
 
-/// Test background/stream conflict
+/// Test background + stream / background + store validation.
+///
+/// `background=true` with `stream=true` is VALID — a streaming background create
+/// sources its SSE from the persisted event log. What `background=true` requires
+/// instead is `store=true`, so the response can be polled, resumed, or cancelled.
 #[test]
-fn test_validate_background_stream_conflict() {
-    // Invalid: both background and stream enabled
+fn test_validate_background_stream_and_store() {
+    // Valid: background together with stream.
     let request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
         background: Some(true),
         stream: Some(true),
         ..Default::default()
     };
+    assert!(
+        request.validate().is_ok(),
+        "background=true with stream=true should be valid"
+    );
+
+    // Invalid: background with an explicit store=false.
+    let request = ResponsesRequest {
+        input: ResponseInput::Text("test".to_string()),
+        background: Some(true),
+        store: Some(false),
+        ..Default::default()
+    };
     let result = request.validate();
     assert!(
         result.is_err(),
-        "background=true with stream=true should be invalid"
+        "background=true with store=false should be invalid"
     );
-
     if let Err(errors) = result {
-        let error_msg = errors.to_string();
         assert!(
-            error_msg.contains("background") || error_msg.contains("stream"),
-            "Error should mention background/stream conflict"
+            format!("{errors:?}").contains("background_requires_store"),
+            "expected background_requires_store, got: {errors:?}"
         );
     }
+
+    // Valid: background with default (unset) store — defaults to true later.
+    let request = ResponsesRequest {
+        input: ResponseInput::Text("test".to_string()),
+        background: Some(true),
+        ..Default::default()
+    };
+    assert!(
+        request.validate().is_ok(),
+        "background=true with default store should be valid"
+    );
 }
 
 /// Test previous_response_id format validation

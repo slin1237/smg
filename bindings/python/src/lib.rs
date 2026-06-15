@@ -366,6 +366,7 @@ impl PyPostgresConfig {
 struct Router {
     host: String,
     port: u16,
+    health_check_port: Option<u16>,
     worker_urls: Vec<String>,
     policy: PolicyType,
     worker_startup_timeout_secs: u64,
@@ -685,6 +686,7 @@ impl Router {
             .policy(policy)
             .host(&self.host)
             .port(self.port)
+            .health_check_port(self.health_check_port)
             .connection_mode(self.connection_mode)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
@@ -882,6 +884,10 @@ impl Router {
         mesh_advertise_host = None,
         drain_settle_secs = 5,
         enable_wasm = false,
+        // Appended last (not inserted mid-list) so every pre-existing
+        // positional argument keeps its index for callers that construct
+        // `_Router(...)` positionally. See the struct-field note above.
+        health_check_port = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -998,6 +1004,9 @@ impl Router {
         mesh_advertise_host: Option<String>,
         drain_settle_secs: u64,
         enable_wasm: bool,
+        // Appended last to match the `#[pyo3(signature)]` order above and
+        // preserve positional-argument compatibility.
+        health_check_port: Option<u16>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1016,6 +1025,7 @@ impl Router {
         Ok(Router {
             host,
             port,
+            health_check_port,
             worker_urls,
             policy,
             worker_startup_timeout_secs,
@@ -1187,6 +1197,7 @@ impl Router {
             Box::pin(server::startup(server::ServerConfig {
                 host: self.host.clone(),
                 port: self.port,
+                health_check_port: self.health_check_port,
                 router_config,
                 max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),

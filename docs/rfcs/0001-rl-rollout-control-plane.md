@@ -77,6 +77,143 @@ worker registry with drain semantics, fleet fan-out helpers, cache-aware
 routing, and — critically — token-in/token-out with logprobs and
 `weight_version` already plumbed end-to-end through `/generate`.
 
+## Customer problems this solves
+
+The customer is the ML-infra team running RL post-training (verl / slime /
+SkyRL / AReaL / TRL) on their own GPU fleet. Their two scarce resources are
+**GPU-hours** (rollout generation dominates RL step time — typically 60–90%
+of wall-clock in agentic RL) and **run stability** (runs last days to weeks;
+a hang or silent corruption discovered late wastes the whole fleet's output).
+Each problem below is observed in the wild, with receipts.
+
+### P1. Stop-the-world weight sync wastes the rollout fleet
+
+**Today.** Every training step (or every N steps), the entire rollout fleet
+halts for weight sync. The choreography is hand-rolled and serialized: slime
+lists workers through the router, then bypasses it to call
+`/abort_request` on every engine in a 3-second polling loop until idle —
+with a vendored "double abort" patch because one abort races in-flight
+requests. verl pauses all replicas fleet-wide. The whole fleet then sits
+idle for drain + transfer + flush + resume. The industry knows how big this
+tax is: NeMo-RL invested heavily to cut refit from 850s to 51s on
+DeepSeek-V3; Moonshot built checkpoint-engine to broadcast 1T params in
+~20s. But *transfer* speed is only half the gap — **drain and re-admission
+are unmanaged**, and nobody overlaps them with useful work.
+
+**With SMG.** Update jobs with `rolling` and `blue-green` strategies keep
+the fleet generating throughout: fresh rollouts route `latest-only` to
+updated workers while stragglers finish on old weights (every response
+version-stamped, so the trainer can TIS-correct or mask the stale tail).
+The rollout gap shrinks from `fleet_drain + transfer + resume` to
+approximately the transfer window of one worker cohort.
+**Outcome metric:** rollout-fleet goodput during update windows (target:
+>80% of steady-state, vs ~0% today with all-at-once sync).
+
+### P2. Long-tail trajectories starve each step
+
+**Today.** A rollout batch waits on its slowest trajectory; sequence-length
+skew means a few 30k-token generations idle the rest of the fleet. The
+state-of-the-art mitigation (DAPO-style oversampling + abort, partial
+rollouts) exists but is fragile client-side machinery: racy aborts,
+per-server polling, and in fully-async modes "the trajectory is re-queued
+and starts over" (slime's own TODO) because resume plumbing is missing.
+
+**With SMG.** Verified fleet abort (per-worker confirmation + `wait_idle`),
+guaranteed abort-with-partials semantics (contract-tested per engine), and
+load-skew-aware policies (least-token-load, bucket) that spread long
+sequences instead of piling them on one worker. Resumed partials land as
+prefix-cache hits because cache-aware routing sends them where the KV
+lives. **Outcome metric:** p95 step time / mean step time ratio; fraction
+of aborted-trajectory tokens successfully reused on resume.
+
+### P3. Silent trajectory corruption destabilizes training
+
+**Today.** The nastiest failures are invisible until the loss curve
+diverges days in: (a) vLLM's legacy weight-update path **does not flush
+prefix cache** — new weights silently reuse old-weight KV; (b) mid-update,
+requests land on mixed-version workers with no record of which version
+generated which tokens; (c) chat-template retokenization drift breaks
+token-level importance sampling (the reason verl/slime docs mandate
+token-in/token-out); (d) engine numerics make "on-policy" RL silently
+off-policy unless rollout logprobs are captured (the TIS/R3 findings). None
+of today's routers prevent or even *label* any of this.
+
+**With SMG.** Prevention where possible, attribution everywhere else:
+guaranteed post-update flush with independent confirmation via
+`KvCacheCleared` events; version-consistent routing (`latest-only`,
+`max-staleness:k`) plus universal per-response version stamping — including
+on vLLM and TRT-LLM, which cannot stamp responses themselves; a
+contract-tested token-in/token-out + logprob-fidelity data plane; MoE
+routed-experts passthrough for R3-style replay. Silent corruption becomes
+either impossible or a labeled, correctable property of the data.
+**Outcome metric:** zero unattributed-version tokens in any trajectory;
+stale-KV incidents = 0 by construction.
+
+### P4. Long runs die from operational fragility
+
+**Today.** Multi-day runs accumulate infrastructure failures: router↔engine
+503s after long RL runs (slime#1391), router panic loops when all workers
+die (sglang#7028), fleets left half-paused because pause/continue verbs got
+load-balanced to different workers (sglang#21235), stuck aborts under LoRA
+and PD (sglang#29179, #10613), verl server-mode hangs (#5815 and the #2618
+tracking cluster). Every such event costs the fleet until a human notices.
+
+**With SMG.** Control verbs are worker-addressed with per-worker
+verification, retries, and a reconciliation sweep (a fleet can never be
+half-paused without the job reporting exactly which workers diverged);
+existing circuit breakers, health monitoring, and draining apply to rollout
+fleets; failed workers are version-quarantined instead of poisoning the
+batch; and elastic replacement is automatic — a fresh worker registering
+mid-run is brought to `target_version` (disk or checkpoint-engine P2P)
+before it becomes routable. This also unlocks **spot/preemptible GPUs for
+rollout capacity**, which no RL stack safely supports today.
+**Outcome metric:** MTBF of rollout infrastructure per run; human
+interventions per training week; recovery time from worker loss.
+
+### P5. Multi-turn agentic rollouts re-prefill the world
+
+**Today.** Agentic RL (the growth workload: SWE agents, tool-use loops)
+re-sends a growing prefix every turn. verl's in-house balancer is
+least-in-flight + sticky LRU — no cache awareness, no PD; OpenRLHF shards
+round-robin. Measured impact of doing this well (sgl-router cache-aware
+numbers): +92% throughput, cache hit rate 20%→75%.
+
+**With SMG.** Best-in-class cache-aware routing (event-driven precise mode
+with per-worker KV block state, approximate radix fallback) plus PD
+disaggregation and sticky routing keys applies to rollouts unchanged — an
+inherited advantage no RL framework's built-in dispatcher matches.
+**Outcome metric:** prefill cache-hit rate and tokens/GPU-hour on
+multi-turn rollout workloads.
+
+### P6. One fleet per framework per engine; serving GPUs idle while rollouts queue
+
+**Today.** Rollout plumbing is engine-locked (slime→SGLang; OpenRLHF→vLLM),
+so teams cannot mix engines, switch engines without rewriting integration,
+or reuse production serving capacity for training. Serving fleets sit at
+partial utilization on off-peak hours while rollout jobs wait for dedicated
+GPUs (the ROSE paper demonstrates serving clusters can absorb rollout load
+under SLO preservation — no product supports it).
+
+**With SMG.** One control plane across vLLM/SGLang/TRT-LLM/TokenSpeed; the
+same gateway serves production and rollouts with a `rollout` priority class
+(preemptible, below interactive SLO traffic) and per-tenant clamps —
+opportunistic rollout on idle serving capacity becomes a config, not a
+research project. And because training-time scoring and production serving
+traverse identical tokenization/parsers/sampling defaults, train/serve
+score discrepancies ("it evaluated fine in training") disappear.
+**Outcome metric:** aggregate fleet utilization; rollout tokens generated
+on otherwise-idle serving capacity; train-vs-serve eval delta.
+
+### North-star metrics for the feature
+
+1. **Rollout goodput during weight-sync windows** (P1) — the headline
+   efficiency number.
+2. **Tokens/GPU-hour on agentic multi-turn rollouts** (P2, P5).
+3. **Unattributed-version tokens per run** (P3) — the headline stability
+   number; must be zero.
+4. **Human interventions per training week / MTBF** (P4).
+5. **Fleet utilization for co-tenant serve+rollout deployments** (P6).
+
 ### Why a gateway at all (the "train/serve WYSIWYG" argument)
 
 Routing rollouts and production traffic through the same gateway eliminates

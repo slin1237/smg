@@ -2,7 +2,10 @@
 
 - **Status**: Draft
 - **Created**: 2026-07-18
-- **Scope**: model_gateway, crates/grpc_client, crates/protocols, crates/workflow, crates/data_connector
+- **Scope**: model_gateway, crates/grpc_client, crates/protocols, crates/workflow, crates/data_connector, crates/auth, crates/mesh
+- **Validation**: all load-bearing engine/framework/competitive/codebase claims
+  adversarially verified against primary sources on 2026-07-18 (see
+  §Validation status).
 
 ## Summary
 
@@ -44,19 +47,24 @@ thinner than the positioning:
   then **bypasses the router** to call `/abort_request {"abort_all": true}`
   on each engine in a 3-second polling loop — with a vendored "double abort"
   patch because a single abort races in-flight requests.
-- Naive load balancing of control verbs split-brains fleets: a
-  `pause_generation` that landed on one worker and `continue_generation` on
-  another left 1/8 of a fleet paused
-  ([sglang#21235](https://github.com/sgl-project/sglang/issues/21235)).
-- `weight_version` is a passive label. Nothing prevents mixed-version rollouts
-  mid-update, and nothing routes or quarantines by version.
-- Everything is coupled to SGLang server APIs. vLLM worker support was
-  explicitly deflected ([sglang#11703](https://github.com/sgl-project/sglang/issues/11703)).
+- Control verbs are hazardous when load-balanced naively: SGLang hit exactly
+  this bug class *inside a single server* — `pause_generation` landing on one
+  tokenizer worker and `continue_generation` on another left 1/8 of workers
+  paused ([sglang#21235](https://github.com/sgl-project/sglang/issues/21235);
+  fixed by server-internal broadcast, **not** by gateway fan-out — the fleet-
+  level version of the problem remains unowned).
+- `weight_version` is a passive label emitted as `system_fingerprint`.
+  Nothing prevents mixed-version rollouts mid-update, and nothing routes or
+  quarantines by version (verified: zero references in the gateway's policy
+  code).
+- The gateway recently gained vLLM gRPC worker support for *serving* — but
+  it exposes **no RL control endpoints for any backend**, SGLang included.
 
 Meanwhile the demand side is explicit:
 
 - verl's community has open RFCs for exactly this: a **Trajectory Gateway**
-  ([verl#5790](https://github.com/volcengine/verl/issues/5790)) and
+  ([verl#5790](https://github.com/volcengine/verl/issues/5790), with
+  implementation redirected to the new `verl-project/uni-agent` repo) and
   RemoteAgentLoop ([verl#5737](https://github.com/volcengine/verl/issues/5737));
   verl's in-house `GlobalRequestLoadBalancer` is a single Ray actor doing
   least-in-flight + sticky LRU — no cache awareness, no PD, no fault tolerance.
@@ -65,11 +73,21 @@ Meanwhile the demand side is explicit:
   interface for RL frameworks" — engine-side primitives waiting for a control
   plane.
 - SGLang's own 2026 roadmaps commit to "Gateway as the DP scheduler for
-  rollout" and a "shared rollout interface" with slime/verl/AReaL — the race
-  is on, and the incumbent is single-engine.
-- HuggingFace's survey of 16 RL libraries concludes **no common API standard
-  exists**; every framework re-implements weight sync, interrupts, and
-  staleness bookkeeping against raw engine APIs.
+  rollout" and a "shared rollout interface" with slime/verl/AReaL — declared
+  but unshipped as of July 2026 (roadmap items verified unchecked).
+- **NVIDIA Dynamo is the clock on this opportunity**: its RL roadmap
+  ([dynamo#9178](https://github.com/ai-dynamo/dynamo/issues/9178)) has
+  already shipped a token-in/token-out RL response protocol (June 2026) and
+  targets trainer→rollout weight sync via ModelExpress/NIXL plus "RL-aware
+  routing" around **August 2026**. Dynamo is NVIDIA-stack-centric; the
+  positioning that survives its ship date is SMG's engine-agnosticism,
+  version-consistent routing + provenance (on no competitor's roadmap), and
+  the enterprise governance story (§Security).
+- HuggingFace's survey of 16 RL libraries ("Keep the Tokens Flowing")
+  documents fragmentation across all seven design axes — the only de facto
+  contract is `(token_ids, logprobs, finish_reason)`, which is insufficient;
+  every framework re-implements weight sync, interrupts, and staleness
+  bookkeeping against raw engine APIs.
 
 SMG is uniquely positioned: it is already engine-agnostic (HTTP + gRPC clients
 for vLLM, SGLang, TRT-LLM, TokenSpeed), already has a DAG workflow engine, a
@@ -81,10 +99,13 @@ routing, and — critically — token-in/token-out with logprobs and
 
 The customer is the ML-infra team running RL post-training (verl / slime /
 SkyRL / AReaL / TRL) on their own GPU fleet. Their two scarce resources are
-**GPU-hours** (rollout generation dominates RL step time — typically 60–90%
-of wall-clock in agentic RL) and **run stability** (runs last days to weeks;
-a hang or silent corruption discovered late wastes the whole fleet's output).
-Each problem below is observed in the wild, with receipts.
+**GPU-hours** (rollout generation dominates RL step time — published
+profiling puts it at **more than 90% of total runtime** in long-tail agentic
+RL; APRIL, [arXiv:2509.18521](https://arxiv.org/abs/2509.18521)) and **run
+stability** (runs last days to weeks; a hang or silent corruption discovered
+late wastes the whole fleet's output). Each problem below is observed in the
+wild, with receipts. All claims in this section were adversarially
+re-verified against primary sources on 2026-07-18.
 
 ### P1. Stop-the-world weight sync wastes the rollout fleet
 
@@ -95,10 +116,11 @@ lists workers through the router, then bypasses it to call
 with a vendored "double abort" patch because one abort races in-flight
 requests. verl pauses all replicas fleet-wide. The whole fleet then sits
 idle for drain + transfer + flush + resume. The industry knows how big this
-tax is: NeMo-RL invested heavily to cut refit from 850s to 51s on
-DeepSeek-V3; Moonshot built checkpoint-engine to broadcast 1T params in
-~20s. But *transfer* speed is only half the gap — **drain and re-admission
-are unmanaged**, and nobody overlaps them with useful work.
+tax is: NeMo-RL invested heavily to cut refit from 850s to 51s (16x) on
+DeepSeek-V3 (v0.3.0 release notes); Moonshot built checkpoint-engine to
+broadcast 1T params fleet-wide in 14–20s. But *transfer* speed is only half
+the gap — **drain and re-admission are unmanaged**, and nobody overlaps them
+with useful work.
 
 **With SMG.** Update jobs with `rolling` and `blue-green` strategies keep
 the fleet generating throughout: fresh rollouts route `latest-only` to
@@ -151,11 +173,14 @@ stale-KV incidents = 0 by construction.
 
 ### P4. Long runs die from operational fragility
 
-**Today.** Multi-day runs accumulate infrastructure failures: router↔engine
-503s after long RL runs (slime#1391), router panic loops when all workers
-die (sglang#7028), fleets left half-paused because pause/continue verbs got
-load-balanced to different workers (sglang#21235), stuck aborts under LoRA
-and PD (sglang#29179, #10613), verl server-mode hangs (#5815 and the #2618
+**Today.** Multi-day runs accumulate infrastructure failures: router panic
+loops when all workers die (sglang#7028, closed only via a full router
+rewrite), workers left half-paused because pause/continue verbs fanned out
+inconsistently (sglang#21235), stuck aborts under LoRA and PD
+(sglang#29179, #10613), router↔engine 503s surfacing only after 50+ steps
+of training (slime#1391 — root-caused to environment-specific IP
+resolution, which is precisely the class of deployment fragility a managed
+control plane absorbs), verl server-mode hangs (#5815 and the #2618
 tracking cluster). Every such event costs the fleet until a human notices.
 
 **With SMG.** Control verbs are worker-addressed with per-worker
@@ -176,7 +201,9 @@ interventions per training week; recovery time from worker loss.
 re-sends a growing prefix every turn. verl's in-house balancer is
 least-in-flight + sticky LRU — no cache awareness, no PD; OpenRLHF shards
 round-robin. Measured impact of doing this well (sgl-router cache-aware
-numbers): +92% throughput, cache hit rate 20%→75%.
+benchmark): +92% throughput, cache hit rate 20%→75% — on a synthetic
+shared-prefix workload (8×A100, Llama-3.1-8B, DP-8), so treat it as the
+best case; real gains depend on prefix-sharing structure.
 
 **With SMG.** Best-in-class cache-aware routing (event-driven precise mode
 with per-worker KV block state, approximate radix fallback) plus PD
@@ -192,7 +219,8 @@ so teams cannot mix engines, switch engines without rewriting integration,
 or reuse production serving capacity for training. Serving fleets sit at
 partial utilization on off-peak hours while rollout jobs wait for dedicated
 GPUs (the ROSE paper demonstrates serving clusters can absorb rollout load
-under SLO preservation — no product supports it).
+SLO-safely, reporting 1.20–3.31x end-to-end throughput vs resource-fixed
+baselines — no product supports it).
 
 **With SMG.** One control plane across vLLM/SGLang/TRT-LLM/TokenSpeed; the
 same gateway serves production and rollouts with a `rollout` priority class
@@ -269,8 +297,9 @@ adapter trait in the detailed design.
 | Abort requests | `POST /abort_request {rid \| abort_all}` — running requests return partial tokens with `finish_reason=abort` | no public per-request endpoint; disconnect aborts; `/pause?mode=abort` for fleet | engine `Abort` RPC |
 | Flush KV | `POST /flush_cache` (auto after weight updates by default) | `POST /reset_prefix_cache` (dev mode; NOT automatic after legacy weight updates) | — |
 | Version stamp in responses | yes: `meta_info.weight_version` (+ `GET /get_weight_version`) | **no** — gateway must supply | no — gateway must supply |
-| Token-in/token-out + logprobs | `/generate` `input_ids`, `return_logprob`, `output_token_logprobs` | `prompt_token_ids` / `return_token_ids`, `logprobs`, `prompt_logprobs` | via gRPC Generate |
-| Routed experts (MoE R3) | fork-only today (`return_routed_experts`) | `TokenOutput.routed_experts` in verl path | — |
+| Token-in/token-out + logprobs | `/generate` `input_ids`, `return_logprob`, `output_token_logprobs` (`output_ids` top-level) | `prompt_token_ids` / `return_token_ids`, `logprobs`, `prompt_logprobs` | via gRPC Generate |
+| Routed experts (MoE R3) | **mainline since Dec 2025** (`return_routed_experts`, PR #12162) | `TokenOutput.routed_experts` in verl path | — |
+| DP rank pinning | `routed_dp_rank` body field | HTTP **header** (router-injected) or per-rank endpoints (external LB) | — |
 
 Key sequencing constraints learned from engine docs and postmortems:
 
@@ -535,10 +564,14 @@ Notes:
 
 ### 5. Data-plane extensions
 
-- **Rollout QoS**: map RL traffic to the existing priority scheduler —
-  a `rollout` class below `default` (extend the `Class` enum) so co-tenant
-  serving+rollout fleets (ROSE-style) keep SLO traffic first; rollout tenants
-  clamped via existing `TenantPolicy`.
+- **Rollout QoS**: map RL traffic to the existing priority scheduler's
+  **`Bulk` class** (already below `Default`), with rollout tenants clamped
+  via existing `TenantPolicy`, so co-tenant serving+rollout fleets
+  (ROSE-style) keep SLO traffic first. We deliberately do NOT add a new
+  `Class` variant: the per-class inflight accounting packs exactly four u16
+  lanes into one fully-consumed `AtomicU64` (`scheduler/slots.rs`), so a
+  fifth class would force a rework of the lock-free admission hot path for
+  no semantic gain over `Bulk`.
 - **Contract tests per engine** (e2e_test): `input_ids` round-trip fidelity;
   logprob presence/alignment under temperature; abort returns partials with
   correct `finish_reason` and logprobs for generated tokens; version stamp
@@ -546,9 +579,12 @@ Notes:
   These become the advertised "rollout-grade" guarantees, and the retry storm
   tolerance test (slime: 60 retries × 1s, timeout=None) belongs here too.
 - **MoE expert-routing passthrough** (`return_routed_experts`): plumb through
-  `/generate` and gRPC for engines that support it (today: SGLang fork /
-  vLLM verl path). Low cost, and mainline sgl-router doesn't carry it —
-  slime users currently install a forked router wheel for R3.
+  `/generate` and gRPC. Mainline SGLang has supported it since Dec 2025
+  (PR #12162), and the gateway-side field-drop bug was fixed in SMG's own
+  openai-protocol crate (April 2026) — so chat-completions passthrough
+  partially works already; this item is finishing the `/generate` + gRPC
+  plumbing and contract-testing it. slime still ships a forked router wheel
+  for R3, so a verified mainline path here is an immediate adoption wedge.
 - **Sticky routing for multi-turn rollouts**: `X-SMG-Routing-Key` already
   exists (consistent-hashing policy). Document it as the rollout session key;
   cache-aware policy remains the default recommendation.
@@ -560,15 +596,26 @@ Notes:
   `GenerateRequest` with `return_routed_experts`.
 - `crates/grpc_client` protos: add `Pause`, `Resume`, `ReleaseMemory`,
   `ResumeMemory`, `UpdateWeights{Disk,Tensor,Distributed}`,
-  `InitWeightTransferGroup`, `GetWeightVersion` RPCs to `common.proto` /
-  per-engine protos, implemented first in the SGLang servicer and TokenSpeed
-  (co-design), HTTP fallback elsewhere. `GenerateComplete.weight_version`
-  already exists.
+  `InitWeightTransferGroup` RPCs to `common.proto` / per-engine protos,
+  implemented first in the SGLang servicer and TokenSpeed (co-design), HTTP
+  fallback elsewhere. Note (verified): no engine proto's `GenerateComplete`
+  carries `weight_version` — today SMG synthesizes the response stamp from
+  worker labels in `dispatch_metadata.rs`, and `weight_version` is available
+  via the existing `GetModelInfo` RPC, so no separate `GetWeightVersion` RPC
+  is needed. Optionally add `weight_version` to `GenerateComplete` in the
+  SGLang/TokenSpeed servicers so per-response engine truth can be
+  cross-checked against the label.
 - `model_gateway`: `EngineControl` impls on `BasicWorker` (dual dispatch like
-  `flush_cache`); `WeightVersionRegistry` (+ mesh adapter); workflow steps +
-  `create_fleet_weight_update_workflow`; `/v1/rl/*` routes; `Class::Rollout`;
+  `flush_cache`); `WeightVersionRegistry` (+ mesh adapter — the mesh adapter
+  pattern in `mesh/adapters/` has three existing exemplars to follow);
+  workflow steps + `create_fleet_weight_update_workflow`; `/v1/rl/*` routes;
+  rollout traffic mapped to the existing `Bulk` priority class (see §5);
   version-aware filtering in `get_healthy_worker_indices` (one added
-  predicate, policy-agnostic).
+  predicate, policy-agnostic). Version flips MUST go through the registry's
+  `register_or_replace` path, not user-facing PATCH — verified: the PATCH
+  worker-update workflow re-initializes the model's cache-aware tree
+  (`update_policies_for_worker.rs`), which would trash rollout cache
+  locality on every weight update.
 - `crates/data_connector` (Phase 4 seam only): reserve
   `extra_columns`/hooks-based trajectory columns (`weight_version`, reward,
   token counts) on stored responses.
@@ -602,22 +649,198 @@ Thin shims, in adoption-priority order:
    are Ray-actor + torch-tensor native (ZMQ/CUDA-IPC refit into engine
    internals), with HTTP only as an environment-facing add-on.
 
+## Enterprise use cases (distinct from open source)
+
+Open-source RL users (labs, framework authors) want raw throughput and control
+on a trusted single-tenant network. Enterprise buyers want the same efficiency
+*plus* governance, and the research shows they overwhelmingly **buy managed RL
+platforms** rather than operate trainer/inference co-scheduling themselves
+(CoreWeave Serverless RL, OpenAI/Azure RFT, Fireworks RFT, Predibase, Databricks
+TAO, AWS Bedrock/SageMaker RFT). Named enterprise RL outcomes cluster into three
+use cases: **agent reliability / tool-use accuracy** (Runloop +12% Stripe-API
+codegen, QA Wolf, SquadStack), **expert-graded domain reasoning** (Harvey +20%
+legal-citation F1, Accordance +39% tax analysis, Ambience +12pts ICD-10 coding),
+and **frontier-quality-at-small-model-cost** (Fireworks/Predibase distillation
+cases). SMG's play is the self-hosted control plane underneath these — for
+enterprises that cannot send proprietary code, PHI, or regulated data to a SaaS
+trainer.
+
+The reframing that matters: **for enterprise, the security gap IS the value
+proposition.** The RL substrate (vLLM dev-mode RL endpoints, NCCL,
+torch.distributed, Ray) is unauthenticated and unencrypted *by design* — vLLM's
+own security docs state inter-node comms are "insecure by default," there is a
+CVSS 9.8 RCE precedent (CVE-2025-47277, pickle-over-TCPStore), and ShadowRay is
+actively hijacking GPU clusters in the wild. No enterprise can ship this on a
+shared network. A control plane that **owns and authenticates the trigger
+surface** turns an un-shippable substrate into a governed one. That is the
+enterprise answer to "what does SMG bring."
+
+Requirements enterprise RL adds that research setups ignore (prioritized):
+
+**Must design for day one (expensive to retrofit):**
+
+1. **Own/authenticate the weight-transfer + fleet-control trigger surface.**
+   Keep engine dev-mode and NCCL/TCPStore rendezvous ports off any routable
+   network; SMG brokers the trainer↔engine channel and is the only authorized
+   caller. (Core value prop — see §Security M5.)
+2. **RBAC with RL-native verbs** mapped to enterprise identity (OIDC/SAML):
+   distinct permissions for trigger-weight-update, pause/drain-fleet,
+   promote-to-serving, export-weights, register-reward/environment (arbitrary
+   code — privileged). SMG's auth is a binary Admin/User toggle today (§Security
+   M1).
+3. **Immutable, provenance-carrying audit** of every state-changing action —
+   simultaneously the security control and the EU AI Act "downstream modifier"
+   / NIST AI RMF / SR 11-7 model-risk compliance artifact (§Security M3).
+4. **Multi-tenant isolation + accounting** (per-team GPU-time/token chargeback;
+   coexistence with an external quota scheduler like Kueue/Run:ai rather than
+   owning the cluster). Tenancy boundaries can't be bolted on later (§Security
+   M7).
+5. **Separate "sync weights to rollout fleet" from "promote checkpoint to
+   serving,"** with an eval-gated, approval-gated, rollback-able promotion
+   path. RL's continuous weight updates make conflating these dangerous — this
+   is a distinct gate from the rollout weight-sync of §3, and the RFC's update
+   workflows must not auto-promote a rollout version into production serving.
+6. **Self-hostable / air-gap-compatible** control plane, no mandatory outbound
+   SaaS dependency.
+
+**Should have early (layerable):** checkpoint signing/verification (OpenSSF
+Model Signing + sigstore, already adopted by NVIDIA NGC), trajectory data
+governance hooks (retention TTL, PII redaction point, residency pinning),
+budget/quota with alerting, model-registry integration (MLflow/W&B/SageMaker)
+with promotion-stage metadata.
+
+**Can defer:** SCIM auto-provisioning, FIPS/FedRAMP/HITRUST attestations
+(design crypto swappable), GPU-TEE confidential weight transfer (immature —
+leave a seam).
+
+## Security and access control
+
+The orchestration design is sound but currently assumes a trusted
+single-tenant operator on a trusted network, while simultaneously pitching
+untrusted multi-tenant co-tenancy (P6) and exposing the single most dangerous
+primitive in ML infra — **arbitrary weight replacement** — behind a boolean.
+The amendments below are the day-one constraints that make the co-tenancy and
+weight-update stories safe; without them the RFC must scope itself to a single
+trust domain on a segmented network.
+
+Ground truth from an audit of SMG's current code (these are real gaps, some
+pre-existing bugs):
+
+- Authorization is a **binary global `enum Role { Admin, User }`**
+  (`crates/auth/src/config.rs`); every control-plane route gates only on
+  `is_admin()`. No per-resource, per-verb, or per-fleet scoping exists.
+- Tenancy is **data-plane only** (`tenant.rs`, `tenant_resolution.rs`); admin/
+  worker routes receive no tenant resolution — control-plane ops are global.
+- Audit (`crates/auth/src/audit.rs`) is a `tracing` log line with outcome
+  **`Success | Denied` only**, captures path but not parameters, and cannot
+  express weight provenance/lineage or partial-fleet outcomes.
+- **Pre-existing bug:** `crates/mesh/src/mtls.rs` builds the TLS config with
+  `.with_no_client_auth()` despite `require_client_cert` defaulting true — mesh
+  peers are **not** client-authenticated, and cert rotation is a TODO stub.
+  This is disqualifying for gossiping a weight-version registry and should be
+  fixed independently of this RFC.
+
+### Day-one design constraints (must be in the RFC before Phase 1)
+
+- **M1 — Scoped RL capabilities, not `is_admin()`.** Add capability claims
+  `rl:observe` / `rl:operate` (pause/resume/abort/sleep/wake/flush) /
+  `rl:update-weights` / `rl:promote` / `rl:approve`, each bound to a **fleet
+  selector**, enforced by a `check_rl_capability(principal, fleet, verb)` gate
+  ahead of every `/v1/rl/*` handler. Without this, co-tenancy (P6) is a
+  privilege-escalation surface.
+- **M2 — Provenance-verified, approval-gated weight updates.** `WeightUpdateSpec`
+  carries `{artifact_digest, signature, signer_identity}`; SMG verifies bytes
+  against the digest and the signature against a configured trust root
+  (OpenSSF Model Signing / sigstore / internal KMS), constrained to a
+  per-fleet **checkpoint allow-list** of path prefixes / registry URIs. A
+  config-selectable **two-person rule** for `method: disk|distributed|external`
+  reuses the existing `proceed` barrier as the `rl:approve` join point. This
+  turns "arbitrary model replacement" into "verified, allow-listed, dual-
+  controlled promotion."
+- **M3 — Provenance-carrying, tamper-evident audit.** Extend `AuditEvent` with
+  RL fields (`fleet`, `verb`, `target_version`, `source_digest`, `strategy`,
+  `per_worker_outcomes`, `approval_ref`) and outcomes `{Error, Partial}`;
+  persist version **lineage** in the registry history
+  (`{version, digest, signer, promoted_by, approved_by, timestamps, strategy,
+  outcome}`); emit to an append-only / hash-chained sink or SIEM, not only a
+  log line. This is the EU AI Act / NIST / SR 11-7 evidence artifact.
+- **M4 — Network trust model + no cross-tenant rendezvous.** Document that the
+  training/transfer plane MUST be a segmented VLAN/namespace; NCCL is
+  unauthenticated/unencrypted and MUST NOT traverse shared networks. SMG
+  **refuses to compute or distribute a rendezvous whose members span more than
+  one tenant/fleet-owner**, validates every worker in a `distributed` job
+  against the caller's fleet scope (ties to M1), and binds `rank_offset` to an
+  authenticated worker identity, not just an address.
+- **M5 — SMG as sole authorized caller of engine control ports.** When vLLM
+  `VLLM_SERVER_DEV_MODE` / `collective_rpc` paths are enabled (near-RCE), the
+  RFC *mandates* (not advises): engine control endpoints reachable only from
+  the gateway (NetworkPolicy/firewall/mesh-only), mTLS on the SMG→engine hop
+  with the engine rejecting non-SMG callers, direct external engine access
+  disabled. Prefer the native RL API path; treat legacy `collective_rpc` as
+  opt-in with an explicit near-RCE warning.
+- **M6 — Authenticate the mesh before syncing the registry.** Fix
+  `mtls.rs` to install a `ClientCertVerifier` honoring `require_client_cert`;
+  require authenticated peer identity and sign registry CRDT entries so one
+  compromised node cannot forge fleet-wide version state via gossip. Until
+  mesh mutual auth is real, the registry is **single-writer-authoritative**,
+  not gossip-converged.
+- **M7 — Tenant-scoped control-plane objects.** Every fleet / version /
+  update-job / trajectory has an owning tenant; `/v1/rl/*` gets tenant
+  resolution (today no tenant middleware touches admin routes); audit and
+  version views are per-tenant partitioned; trajectory columns carry the
+  owning tenant and enforce read authz. If deferred, the RFC must state that
+  serve+rollout co-tenancy across **distinct trust domains** is out of scope
+  for v1 (same-tenant co-tenancy only).
+- **M8 — Cross-tenant prefix-cache side-channel isolation.** Automatic prefix
+  caching is a published TTFT timing side channel that lets a co-tenant
+  reconstruct another tenant's prompt token-by-token
+  ([arXiv:2508.08438](https://arxiv.org/abs/2508.08438),
+  [arXiv:2603.10726](https://arxiv.org/html/2603.10726v1)), and a high-volume
+  rollout tenant is the ideal adversary. When a `Bulk`-class rollout tenant
+  shares a fleet with SLO serving tenants, prefix/radix reuse MUST be
+  partitioned per tenant for any tenant marked sensitive; add per-tenant
+  KV/cache quotas so rollout cannot evict/starve serving; and ensure the
+  `cached_tokens` field (used in our own contract tests) is not an oracle
+  across tenant boundaries. Default co-tenant deployments to cache isolation;
+  make sharing opt-in per trust domain.
+
+### Phase 2+ hardening
+
+API-key lifecycle (expiry/rotation/revocation; short-lived JWTs for
+operators); rate-limit / precondition-token the destructive verbs
+(`abort {scope: all}`, fleet sleep, update-weights) so stale/replayed calls
+can't nuke a fleet; promote the `weights_checker` sentinel-hash probe from
+stretch to standard post-update verification; real mesh cert rotation +
+SPIFFE-style worker/peer identities; SLSA-style provenance chaining the M2
+digest back to the trainer run; per-tenant audit export + trajectory-read
+logging; runtime KV side-channel mitigations (SafeKV/CacheSolidarity selective
+sharing) beyond M8's default partitioning.
+
 ## Rollout plan (phases)
 
 - **Phase 0 — data-plane hardening (small)**: contract tests per engine;
   abort-partials fidelity; routed-experts passthrough; retry-storm tolerance;
   document `X-SMG-Routing-Key` for rollouts. Ships alone as "SMG is
   rollout-grade today."
-- **Phase 1 — control verbs (medium)**: `EngineControl` trait + SGLang/vLLM
-  adapters; fleet fan-out endpoints (pause/resume/abort/sleep/wake/flush) with
-  per-worker verification. Immediately fixes slime's bypass loop and
-  sglang#6531/#21235-class problems — and works for vLLM fleets, which no
-  router offers.
+- **Phase 1 — control verbs + authz foundation (medium)**: `EngineControl`
+  trait + SGLang/vLLM adapters; fleet fan-out endpoints
+  (pause/resume/abort/sleep/wake/flush) with per-worker verification;
+  **scoped RL capabilities (M1)** and the **network trust model (M4, M5)**
+  land here, not later — they are the gate on exposing any control verb.
+  Immediately fixes slime's bypass loop and the sglang#6531/#21235-class
+  problems — and works for vLLM fleets, which no router offers.
 - **Phase 2 — version registry + update workflows (large)**: registry,
   stamping, version-aware routing, update jobs with all three strategies,
-  checkpoint-engine external mode, elastic-join catch-up.
-- **Phase 3 — framework shims (medium)**: slime validation + upstream PR,
-  verl client, TRL surface, SkyRL/AReaL impls; example configs under
+  checkpoint-engine external mode, elastic-join catch-up. **Provenance-verified
+  + approval-gated updates (M2), provenance-carrying audit (M3), and the mesh
+  auth fix (M6)** are in scope here — the registry must not gossip over the
+  current unauthenticated mesh, and weight updates must be governed from the
+  first shipped version. Separate the rollout-sync path from a gated
+  promote-to-serving path (enterprise req #5).
+- **Phase 3 — framework shims + tenancy (medium)**: slime validation + upstream
+  PR, verl client (watch `verl-project/uni-agent`), TRL surface, SkyRL/AReaL
+  impls; **tenant-scoped control-plane objects (M7) and cache side-channel
+  isolation (M8)** land with the multi-tenant story; example configs under
   `examples/rl/`.
 - **Phase 4 — trajectory capture (separate RFC)**: rollout trajectory
   storage on the data_connector seam; token-faithful capture from black-box
@@ -625,16 +848,30 @@ Thin shims, in adoption-priority order:
 
 ## Competitive positioning
 
-| Capability | SGLang gateway | vLLM router / llm-d / Dynamo | verl in-house | **SMG (this RFC)** |
-|---|---|---|---|---|
-| Cross-engine (vLLM+SGLang+TRT+TokenSpeed) | no | no | n/a | **yes** |
-| Gateway fan-out control verbs | no (flush only) | no | no | **yes, verified per worker** |
-| Weight-update orchestration | no (client-side) | no | framework-internal | **yes, 3 strategies** |
-| Version registry + version-aware routing | no (passive label) | no | `global_steps` stamping only | **yes** |
-| Universal per-response version stamping | SGLang-only | no | n/a | **yes, all engines** |
-| Abort with partials at gateway | no (open issue) | no | replica-wide only | **yes + per-request where supported** |
-| Reward pools behind same gateway | implicit (multi-model) | no | separate sglang-router | **first-class role** |
-| Serve+rollout QoS co-tenancy | no | no | no | **priority classes** |
+| Capability | SGLang gateway | Dynamo (NVIDIA-stack) | vLLM router / llm-d / AIBrix | verl in-house | **SMG (this RFC)** |
+|---|---|---|---|---|---|
+| Cross-engine (vLLM+SGLang+TRT+TokenSpeed) | serving only | NVIDIA-centric | no | n/a | **yes** |
+| Gateway fan-out control verbs | no (flush only) | roadmap ~Aug'26 | no | no | **yes, verified per worker** |
+| Weight-update orchestration | no (client-side) | roadmap ~Aug'26 (NIXL) | no | framework-internal | **yes, 3 strategies, engine-agnostic** |
+| Version registry + version-aware routing | no (passive label) | no | no | `global_steps` stamping only | **yes** |
+| Universal per-response version stamping | SGLang-only | TITO protocol | no | n/a | **yes, all engines** |
+| Abort with partials at gateway | no (open issue) | roadmap ("pause agents") | no | replica-wide only | **yes + per-request where supported** |
+| Reward pools behind same gateway | implicit (multi-model) | no | no | separate sglang-router | **first-class role** |
+| Serve+rollout QoS co-tenancy | no | no | no | no | **Bulk priority class** |
+| Enterprise governance (RBAC/provenance/audit/tenancy) | no | no | no | no | **designed in (§Security)** |
+
+**Shelf life of this table (verified 2026-07-18):** NVIDIA Dynamo's RL
+roadmap ([#9178](https://github.com/ai-dynamo/dynamo/issues/9178)) is the
+one to watch — it has already shipped a token-in/token-out (TITO) RL
+response protocol and ModelExpress model loading, and targets trainer→rollout
+weight sync via NIXL plus RL-aware routing around **August 2026**. When that
+ships, "nobody orchestrates RL weight updates at the gateway" expires. The
+differentiation that outlasts it is the combination no single competitor is
+pursuing: **engine-agnostic** (Dynamo is NVIDIA-stack), **version-consistent
+routing + weight provenance** (on no competitor's roadmap), and **enterprise
+governance** (RBAC, audit, tenancy, checkpoint signing — §Security). The
+window to land Phase 1 is roughly two quarters; the RFC is scoped so Phase 0
+and Phase 1 deliver standalone value before it closes.
 
 ## Risks and open questions
 
@@ -661,10 +898,49 @@ Thin shims, in adoption-priority order:
    worker and decode worker may briefly disagree on version; KV transferred
    across versions is invalid. Rule: update jobs treat a PD group as one
    atomic unit (drain/flip together). Needs an e2e test.
-6. **Class enum extension** (`rollout` priority class) touches the packed
-   per-class inflight accounting; small but load-bearing change.
+6. **Weight-supply-chain risk is the dominant security concern**, not an
+   afterthought — `update-weights` is arbitrary model replacement. Addressed
+   by §Security M2 (provenance verification + approval gating); called out
+   here because it is the risk most likely to block enterprise adoption if
+   under-designed.
+7. **Competitive window (~2 quarters).** Dynamo's RL roadmap and verl's
+   `uni-agent` are both moving; Phase 0/1 must ship standalone value fast.
+
+## Validation status
+
+Every load-bearing claim in this RFC was adversarially re-verified against
+primary sources (engine docs, framework source on `main`, GitHub issues/PRs)
+and the SMG codebase on **2026-07-18**. Result: claims held up broadly, with
+these corrections already folded in above:
+
+- vLLM DP rank pinning is via a **router-injected HTTP header**, not a request
+  body field; the old disconnect-detection middleware bug is **fixed** (not a
+  current risk).
+- No engine proto's `GenerateComplete` carries `weight_version` — SMG
+  synthesizes the response stamp from worker **labels** today (this
+  *strengthens* the "only the gateway can stamp version" thesis); `GetModelInfo`
+  already returns `weight_version`, so no new `GetWeightVersion` RPC is needed.
+- Rollout traffic maps to the existing **`Bulk`** priority class; adding a
+  fifth `Class` variant would force a rework of the lock-free `AtomicU64`
+  admission accounting for no gain.
+- Version flips must route through `register_or_replace`, **not** user-facing
+  PATCH, which rebuilds the model's cache-aware tree.
+- SGLang `return_routed_experts` is **mainline since Dec 2025**, and the
+  gateway-side passthrough fix already landed in SMG's openai-protocol crate
+  (April 2026) — part of Phase 0 is effectively done.
+- Rollout-dominance is **>90% of runtime** (APRIL), not the softer "60–90%"
+  originally stated; the sgl-router +92% figure is a **synthetic best case**.
+- SGLang's pause/continue split-brain (#21235) was **intra-server** across
+  tokenizer workers, not a router-fleet failure — still proof the verbs are
+  fan-out-hazardous, but reframed accordingly.
+- **Pre-existing SMG bug surfaced:** `crates/mesh/src/mtls.rs` uses
+  `.with_no_client_auth()` despite `require_client_cert` defaulting true — mesh
+  peers are not client-authenticated. Must be fixed before the registry
+  gossips over the mesh (§Security M6); worth fixing independently.
 
 ## References
+
+All URLs verified 2026-07-18.
 
 Engine primitives: vLLM sleep-mode docs & RFC #15254, native RL APIs blog
 (2026-05-28) & weight-transfer docs & async-RL docs, PR #22587
@@ -678,5 +954,20 @@ doc; TRL `vllm_serve.py` & vLLM-integration docs; SkyRL `InferenceEngine`
 interface docs; HF "async RL training landscape" survey.
 
 Competitive: SGLang Model Gateway docs & source (server.rs route table),
-issues #6531, #21235, #11703, #13098 (roadmap), #12780 (Q1 2026), #22949
-(Q2 2026); slime issues #1391, #1792.
+issues #6531, #21235 (+ fix PR #24462), #11703, #13098 (roadmap), #12780
+(Q1 2026), #22949 (Q2 2026); slime issues #1391, #1792; NVIDIA Dynamo RL
+roadmap #9178 & releases; verl `uni-agent` (PR #25); vLLM Q2 RL roadmap
+#41733; HF "Keep the Tokens Flowing" survey.
+
+Enterprise & security: CoreWeave Serverless RL, OpenAI/Azure RFT use cases,
+Fireworks/Predibase RFT; NIST AI 600-1, EU AI Act GPAI downstream-modifier
+guidance, SR 11-7; RAND "Securing AI Model Weights"; OpenSSF Model Signing +
+sigstore/model-transparency; CVE-2025-47277 (vLLM PyNcclPipe RCE), ShadowRay
+2.0; KV-cache side-channel papers arXiv:2508.08438, 2603.10726, 2508.09442;
+vLLM security docs; Kueue / NVIDIA Run:ai multi-tenant scheduling.
+
+Quantitative: NeMo-RL v0.3.0 release notes (850→51s refit) & discussion #1189
+(692.5→47.2s); MoonshotAI checkpoint-engine README (1T in 14–20s); LMSYS
+SGLang v0.4 blog (+92% synthetic); APRIL arXiv:2509.18521 (>90% runtime);
+AReaL arXiv:2505.24298 (2.77x); ROSE arXiv:2605.06534 (1.20–3.31x); Vercel AI
+Gateway production index (58.9% tool-call tokens, Apr 2026).

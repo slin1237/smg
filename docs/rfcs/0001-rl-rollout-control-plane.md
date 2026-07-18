@@ -256,7 +256,8 @@ long-tail sequence lengths — plus the RL-specific control plane this RFC adds.
 - G1. Gateway-native fleet control verbs with correct sequencing, over HTTP
   and gRPC engines, engine dialect differences abstracted away.
 - G2. Weight-update orchestration as first-class workflows: colocated
-  (sleep/wake) and disaggregated (pause/transfer/resume) choreographies,
+  (release / restore GPU memory) and dedicated-rollout (pause / transfer /
+  resume) sequences,
   including drain-and-flip (rolling, blue/green) update strategies.
 - G3. Weight-version registry: per-worker version state, per-response version
   stamping (all engines, not just SGLang), version-consistent routing modes,
@@ -328,7 +329,7 @@ Key sequencing constraints learned from engine docs and postmortems:
 | **TRL** | `POST /generate/ {prompts: [[int]]} → {completion_ids, logprobs}` | `/init_communicator/` + `/update_named_param/` + NCCL bcast (client = last rank) | n/a (sync) | none | implement TRL's 9 endpoints; SMG as `vllm_server_base_url` |
 | **SkyRL** | data plane behind one `external_proxy_url` (OpenAI chat/completions + Tinker-style `/inference/v1/generate`, `X-Session-ID` affinity) | control plane fanned to `external_server_urls`: `/init_weight_transfer_engine`, `/update_weights`, `/get_world_size` | `/pause?mode=abort\|keep\|wait` + `/resume`; abort returns partials, client stitches (`AccumulatedResponse`) | client-side `weight_version` counter; `max_staleness_steps` | SMG serves both proxy and control URLs; cleanest external seam of all frameworks |
 | **AReaL** | `ModelRequest{input_ids} → ModelResponse{output_tokens, output_logprobs, output_versions}`; rid-sticky routing for KV reuse | SGLang verbs with `abort_all_requests: true` (vLLM via patched `/areal_*` endpoints) | pause aborts in-flight; client loop re-issues `input_ids + partial` to the same server | **per-token** `output_versions` (version appended per resume segment); `max_head_offpolicyness` admission formula | implement `RemoteInfBackendProtocol` (~10 pure request/response-mapping functions) against SMG endpoints |
-| **OpenRLHF / NeMo-RL** | Ray-actor tensor contracts, no HTTP | NCCL / CUDA-IPC / ZMQ in-process | sleep/wake around steps | trajectory age drop | out of scope v1 (no HTTP seam); revisit via shims |
+| **OpenRLHF / NeMo-RL** | Ray-actor tensor contracts, no HTTP | NCCL / CUDA-IPC / ZMQ in-process | release / restore memory around steps | trajectory age drop | out of scope v1 (no HTTP seam); revisit via shims |
 
 Common denominator (the "minimal adoptable surface"): tokenized generate with
 logprobs and abort-partials; SGLang-dialect weight verbs plus vLLM-native
@@ -336,35 +337,73 @@ verbs; sgl-router-compatible worker CRUD; optional/disableable gateway health
 checking (slime does its own); reward-model pools as ordinary multi-model
 routing.
 
-## Design overview
+## Terminology
 
-```
-                    ┌────────────────────────────────────────────────┐
- Trainer ──────────▶│  RL Control API   /v1/rl/*  (admin-auth)      │
- (verl/slime/…)     │   • fleets, versions, update jobs, drain      │
-                    ├────────────────────────────────────────────────┤
-                    │  Fleet Weight-Update Workflows (wfaas DAG)     │
-                    │   quiesce → transfer-window → flush → flip     │
-                    ├────────────────────────────────────────────────┤
-                    │  EngineControl adapter (per ConnectionMode)    │
-                    │   SGLang HTTP/gRPC │ vLLM native │ TRT coarse  │
-                    ├────────────────────────────────────────────────┤
- Rollout ──────────▶│  Data plane (existing routers/policies)       │
- requests           │   + version stamping + rollout QoS class      │
-                    └────────────────────────────────────────────────┘
-                         │            │             │
-                      policy pool   policy pool   reward pool
-                      (vLLM)        (SGLang)      (any)
+This document is written for human reviewers. It avoids engine-specific and
+vendor-specific words in favor of plain language, and defines every recurring
+term here once.
+
+| Term | Meaning |
+|---|---|
+| **Rollout** | One generation request made during RL training: the model reads a prompt and produces a response (a "trajectory") that the trainer later scores. Rollouts are high-volume and often multi-turn. |
+| **Rollout group** | A named set of inference workers that serve one model for one training run. This is the exact resource the API acts on; it is always called a "rollout group" (or just "group") in the design and API sections. The prose sections use the ordinary word "fleet" when they mean "all the workers, taken together" in a casual sense — e.g. "the whole fleet sits idle" — but any managed, named thing is a rollout group. |
+| **Worker** | One inference-engine process (vLLM, SGLang, TensorRT-LLM, or TokenSpeed) registered behind the gateway. |
+| **In-flight request** | A rollout a worker is generating right now. |
+| **Weight version** | A short label identifying which training checkpoint a worker's weights came from (for example `step-4200`). The trainer advances it after every update. |
+| **Weight update** | The operation of replacing a group's weights with a newer checkpoint and moving every worker to the new weight version. |
+| **Prompt cache** | The per-request state a worker keeps so it does not recompute a prompt prefix it has already processed (an engine's "KV cache"). After a weight change this state is stale and must be cleared, or the new weights would reuse old-weight state — a correctness hazard. |
+| **Quiesce** | Bring a worker to a resting state (no in-flight work) so its weights or memory can be changed safely. |
+
+### API naming principles
+
+1. Each endpoint reads like a plain-English instruction — a verb acting on a
+   named thing (`.../pause-generation`, `.../clear-cache`).
+2. The public API never uses engine-internal words (no "sleep", "flush",
+   "collective RPC"). Those are implementation details, mapped per engine
+   inside the gateway (see the mapping table in the detailed design, part 1).
+3. One concept has exactly one name, and every name appears in the table above.
+4. Request and response fields spell out their meaning
+   (`in_flight: "cancel-and-return-partial"`), so both a human reviewer and a
+   coding assistant can read intent without a lookup.
+
+```mermaid
+flowchart TB
+  trainer["Training job<br/>(verl / slime / SkyRL / AReaL / TRL)"]
+
+  subgraph gateway["Shepherd Model Gateway"]
+    api["Rollout control API<br/>/v1/rollout/*"]
+    orch["Weight-update orchestrator<br/>(ordered, verified steps)"]
+    registry[("Weight-version registry")]
+    adapter["Per-engine control adapter"]
+    dataplane["Rollout data plane<br/>(routing, version stamping, priority)"]
+  end
+
+  subgraph group["Rollout group"]
+    w1["Worker: vLLM"]
+    w2["Worker: SGLang"]
+    rw["Reward worker"]
+  end
+
+  trainer -->|"start / approve update,<br/>signal transfer complete"| api
+  trainer -->|"rollout requests<br/>(tokens in, tokens out)"| dataplane
+  api --> orch
+  orch --> registry
+  orch --> adapter
+  dataplane --> registry
+  adapter -->|"pause, clear cache,<br/>release memory, update"| w1 & w2
+  dataplane -->|"routed rollouts"| w1 & w2 & rw
+  trainer -.->|"weights over NCCL / shared memory —<br/>never through the gateway"| w1 & w2
 ```
 
 Five new pieces, all riding existing subsystems:
 
-1. **`EngineControl` trait** — normalizes the verb table above per engine.
-2. **RL fleet model** — worker groups with roles (`policy` / `reward` /
-   `draft`) and a **weight-version registry**.
-3. **Fleet weight-update workflows** — DAG orchestrations for colocated and
-   disaggregated update choreographies, with drain strategies.
-4. **RL control API** — `/v1/rl/*` admin endpoints exposing 1–3.
+1. **`EngineControl` adapter** — one set of operations the gateway calls,
+   translated to each engine's own request names.
+2. **Rollout groups + weight-version registry** — worker groups with roles
+   (`policy` / `reward` / `draft`) and a record of every worker's weight version.
+3. **Weight-update orchestrator** — ordered, verified update sequences for
+   both co-located and dedicated-rollout setups, with three rollout strategies.
+4. **Rollout control API** — `/v1/rollout/*` endpoints exposing 1-3.
 5. **Data-plane extensions** — universal version stamping, rollout QoS class,
    MoE expert passthrough, contract tests.
 
@@ -378,140 +417,209 @@ dispatch HTTP/gRPC for `flush_cache`, `start_profile`, `stop_profile`):
 ```rust
 #[async_trait]
 pub trait EngineControl: Send + Sync {
-    /// What this engine supports; probed at registration, cached in labels.
-    fn capabilities(&self) -> RlCapabilities;
+    /// Which of the operations below this engine actually supports.
+    /// Probed once, when the worker registers.
+    fn capabilities(&self) -> EngineCapabilities;
 
-    async fn sleep(&self, tags: MemoryTags) -> Result<()>;          // weights | kv | all
-    async fn wake(&self, tags: MemoryTags) -> Result<()>;
-    async fn pause(&self, mode: PauseMode) -> Result<PauseReport>;  // Abort | Drain | Freeze
-    async fn resume(&self) -> Result<()>;
-    async fn abort_all(&self) -> Result<AbortReport>;               // returns num aborted
-    async fn flush_kv(&self) -> Result<()>;
-    async fn wait_idle(&self, timeout: Duration) -> Result<()>;     // poll loads until 0 in-flight
+    // --- generation control ---
+    async fn pause_generation(&self, in_flight: InFlightPolicy) -> Result<PauseReport>;
+    async fn resume_generation(&self) -> Result<()>;
+    async fn cancel_in_flight(&self) -> Result<CancelReport>;   // count + partials preserved
+    async fn wait_until_idle(&self, timeout: Duration) -> Result<()>;
 
-    /// Weight update entry points. Tensors never transit SMG.
-    async fn begin_weight_update(&self, spec: &WeightUpdateSpec) -> Result<()>;
-    async fn finish_weight_update(&self, version: &str) -> Result<()>;
-    async fn init_transfer_group(&self, rendezvous: &NcclRendezvous) -> Result<()>;
-    async fn destroy_transfer_group(&self, group: &str) -> Result<()>;
+    // --- GPU memory (so a co-located trainer can borrow the GPU) ---
+    async fn release_gpu_memory(&self, parts: MemoryParts) -> Result<()>;  // weights and/or cache
+    async fn restore_gpu_memory(&self, parts: MemoryParts) -> Result<()>;
 
-    async fn weight_version(&self) -> Result<Option<String>>;
+    // --- prompt cache ---
+    async fn clear_cache(&self) -> Result<()>;
+
+    // --- weight update (tensors travel engine<->trainer, never through SMG) ---
+    async fn open_weight_channel(&self, rendezvous: &TransferRendezvous) -> Result<()>;
+    async fn apply_weights(&self, source: &WeightSource) -> Result<()>;
+    async fn finish_weight_update(&self, version: &WeightVersion) -> Result<()>;
+    async fn close_weight_channel(&self) -> Result<()>;
+
+    async fn read_weight_version(&self) -> Result<Option<WeightVersion>>;
 }
 ```
 
-`PauseMode` maps to engine dialects: `Abort` → SGLang `pause_generation
-{mode: abort}` / vLLM `/pause?mode=abort`; `Drain` → `retract` / `wait`;
-`Freeze` → `in_place` / `keep`. Adapters:
+The gateway speaks these operations in one vocabulary; each adapter translates
+them into its engine's own request names. That translation is what lets a
+single API drive four different engines:
 
-- **SGLang adapter**: native HTTP endpoints (or gRPC where the servicer
-  exposes them). `finish_weight_update` is a no-op (SGLang auto-flushes
-  unless told otherwise); SMG still verifies via `GET /get_weight_version`.
-- **vLLM adapter**: native RL APIs when detected
-  (`/pause`, `/resume`, weight-transfer endpoints); falls back to dev-mode
-  endpoints (`/sleep`, `/wake_up`, `/reset_prefix_cache`, `/collective_rpc`)
-  with an explicit capability flag so operators know which path is active.
-  `finish_weight_update` on the legacy path **always** calls
-  `/reset_prefix_cache` (the known stale-KV footgun).
-- **TRT-LLM adapter**: coarse-grained — `pause(Drain)` via gateway-side
-  draining (stop routing + `wait_idle`), weight updates delegated to the
-  external orchestrator, `capabilities()` reports what's absent so workflows
-  degrade gracefully.
-- **TokenSpeed adapter**: co-designed; the clean-slate opportunity to expose
-  the full verb set over gRPC from day one (see §6, proto changes).
+| Gateway operation | SGLang | vLLM | TensorRT-LLM |
+|---|---|---|---|
+| `pause_generation` | `POST /pause_generation` | `POST /pause` | gateway-side drain |
+| `resume_generation` | `POST /continue_generation` | `POST /resume` | resume routing |
+| `cancel_in_flight` | `POST /abort_request` (all) | client-disconnect abort | `Abort` call |
+| `release_gpu_memory` | `POST /release_memory_occupation` | `POST /sleep` | coarse |
+| `restore_gpu_memory` | `POST /resume_memory_occupation` | `POST /wake_up` | coarse |
+| `clear_cache` | `POST /flush_cache` | `POST /reset_prefix_cache` | — |
+| `apply_weights` | `/update_weights_from_{disk,tensor,distributed}` | native weight-transfer endpoints | IPC refit |
+| `read_weight_version` | `GET /get_weight_version` | (none — gateway supplies) | (none) |
 
-Control verbs are **worker-addressed, never load-balanced**. Fleet scope is
-achieved by explicit fan-out (`admin_fan_out`, already in
-`worker/manager.rs`), with per-worker success/failure reporting.
+`InFlightPolicy` chooses what happens to requests that are running when
+generation is paused. Each value maps to the engines' own modes:
 
-### 2. RL fleet model and weight-version registry
+| `InFlightPolicy` | Meaning | SGLang | vLLM |
+|---|---|---|---|
+| `cancel-and-return-partial` | end them now; hand callers the tokens produced so far | `abort` | `abort` |
+| `wait-for-idle` | let them finish; admit no new work | `retract` | `wait` |
+| `freeze-and-resume-later` | freeze in place; continue exactly where they stopped after resume | `in_place` | `keep` |
 
-**Worker roles.** `WorkerSpec` gains `rl_role: Option<RlRole>`
-(`policy | reward | draft`), defaulting to `policy` for fleets. Reward pools
-are ordinary multi-model routing (register RM workers under their own
-`model_id`), but the role lets operators scope control verbs ("pause policy
-pool only") and lets health/CB policy differ per role.
+Adapters:
 
-**Version registry.** New `WeightVersionRegistry` (in-memory, mesh-synced via
-the existing CRDT KV like worker state):
+- **SGLang adapter** — every operation maps to a native endpoint (or its gRPC
+  equivalent where the servicer exposes one). `finish_weight_update` mostly
+  verifies, since SGLang clears its prompt cache automatically after an update.
+- **vLLM adapter** — prefers vLLM's built-in RL endpoints when present; where it
+  must use development-mode endpoints instead, `finish_weight_update` always
+  clears the prompt cache, because vLLM's older weight path does not do so on
+  its own (a well-known correctness trap). `capabilities()` records which path
+  is active so operators can see it.
+- **TensorRT-LLM adapter** — coarse-grained: `pause_generation(wait-for-idle)`
+  is done by the gateway (stop routing, wait until idle); weight updates are
+  handed to TensorRT-LLM's own orchestrator. `capabilities()` reports what is
+  missing so the orchestrator degrades gracefully.
+- **TokenSpeed adapter** — co-designed with the engine team; the opportunity to
+  expose the full operation set cleanly over gRPC from the start.
 
-```text
-fleet "policy-qwen3" :
-  target_version: "step-4200"
-  workers:
-    w1 → { version: "step-4200", state: Serving }
-    w2 → { version: "step-4100", state: Updating }
-  history: [ {version, started_at, completed_at, strategy, outcome} ]
+Generation-control and weight operations are **addressed to specific workers,
+never load-balanced**. Whole-group scope is achieved by explicit fan-out (the
+existing `admin_fan_out` helper), with a success/failure result recorded for
+each worker.
+
+### 2. Rollout groups and the weight-version registry
+
+**Worker roles.** A worker in a group has a role: `policy` (generates
+rollouts), `reward` (scores them), or `draft` (assists speculative decoding).
+Reward workers are ordinary multi-model routing under their own model name; the
+role simply lets an operator scope an operation ("pause only the policy
+workers") and lets health and circuit-breaker settings differ by role.
+
+**Version registry.** A new `WeightVersionRegistry` records, for each rollout
+group, the target weight version and every worker's current version and state.
+It is kept in memory and, once the mesh is authenticated (see Security, M6),
+shared across gateway nodes.
+
+```json
+{
+  "group": "policy-qwen3-run42",
+  "target_weight_version": "step-4200",
+  "workers": [
+    { "worker": "http://gpu1:8000", "weight_version": "step-4200", "state": "serving" },
+    { "worker": "http://gpu2:8000", "weight_version": "step-4100", "state": "updating" }
+  ],
+  "history": [
+    { "weight_version": "step-4200", "promoted_by": "run42-trainer",
+      "checkpoint_digest": "sha256:...", "started_at": "...", "completed_at": "...",
+      "strategy": "rolling", "outcome": "completed" }
+  ]
+}
 ```
 
-- Per-worker version lives in `labels["weight_version"]` (already read by
-  `dispatch_metadata.rs`), but transitions go through the registry so they're
-  atomic with routing changes — the registry updates the label via the
-  existing `register_or_replace` (which preserves runtime state), not via
-  user-facing PATCH.
-- **Version-aware routing modes** (per model, config or per-request header
-  `X-SMG-Weight-Version`):
-  - `any` (default; today's behavior),
-  - `latest-only` — only workers at `target_version` are routable; mid-update
-    others are effectively quarantined,
-  - `pinned:<v>` — for evaluation replays,
-  - `max-staleness:<k>` — AReaL-style admission: route to workers within k
-    versions of target; otherwise queue or 503 with `Retry-After`.
-- **Universal response stamping**: SMG stamps `weight_version` (and
-  `policy_version_at_dispatch`, in case the engine flips mid-request) into
-  every response's meta — `meta_info.weight_version` on `/generate`,
-  `system_fingerprint` + `metadata` on OpenAI-compat — for **all** engines.
-  vLLM/TRT-LLM responses carry no version natively; the gateway is the only
-  component that can supply it, which is a headline capability. If the engine
-  reports its own version (SGLang), SMG cross-checks and flags divergence.
+A worker moves through these states during its life in a group:
 
-### 3. Fleet weight-update workflows
-
-New workflow family in `WorkflowEngines` (+ `Job::FleetWeightUpdate`),
-following the existing `StepExecutor` pattern. Two choreographies, three
-drain strategies.
-
-**Choreography A — colocated (trainer shares GPUs with rollout):**
-
-```text
-1. QuiescePool        pause(Abort|Drain per config) on all workers; wait_idle
-2. ReleaseMemory      sleep(all) — engines release weights + KV
-   … trainer runs its step(s); SMG waits on /v1/rl/updates/{id}/proceed
-     or a configured webhook …
-3. WakeWeights        wake(weights)
-4. TransferWindow     begin_weight_update per worker (disk/tensor/NCCL init);
-                      wait for trainer's completion signal
-5. FinishUpdate       finish_weight_update (engine flush semantics + verify)
-6. WakeKv             wake(kv)
-7. FlipVersion        registry: worker → target_version; back to Serving
-8. ResumePool         resume; version-aware routing re-admits
+```mermaid
+stateDiagram-v2
+  [*] --> joining: worker registers
+  joining --> serving: caught up to the target version
+  serving --> updating: a weight update begins
+  updating --> serving: update succeeded (now at the new version)
+  updating --> quarantined: update failed on this worker
+  quarantined --> serving: repaired and re-synced
+  serving --> [*]: worker removed
 ```
 
-**Choreography B — disaggregated / async (dedicated rollout fleet):**
+- **Where the version lives.** Each worker's version is stored in its
+  `weight_version` label (already read when routing). All changes go through
+  the registry so they happen atomically with routing changes. The registry
+  updates the label through the internal `register_or_replace` path (which
+  preserves in-flight state), never through the user-facing worker-edit path —
+  that path rebuilds the model's cache-aware routing tree and would discard
+  prompt-cache locality on every update.
+- **Version-aware routing.** A group chooses how strict it is about which
+  version may serve a request. The choice is a group setting, overridable per
+  request with the `X-Rollout-Weight-Version` header:
+    - `any` — any healthy worker, regardless of version (today's behavior).
+    - `latest-only` — only workers already at the target version; during an
+      update, lagging workers are simply not chosen.
+    - `pinned` — a specific version, for reproducing an evaluation.
+    - `within-staleness-limit` — workers no more than N versions behind the
+      target (N is a group setting); if none qualify, the request waits briefly
+      or is refused with a "try again shortly" response.
+- **Universal version stamping.** Every response carries the weight version that
+  produced it — including responses from vLLM and TensorRT-LLM, which do not
+  report a version themselves. Because the gateway is the only component that
+  sees both the routing decision and the response, it is the only place this
+  stamp can be added reliably. When an engine does report its own version
+  (SGLang), the gateway cross-checks it and flags any disagreement.
 
-Strategies (per update job, `strategy` field):
+### 3. Weight-update orchestration
 
-- `all-at-once` — Choreography A steps 1,4,5,7,8 on the whole fleet. Lowest
-  wall-clock, full rollout gap. What slime hand-rolls today.
-- `rolling(batch=N)` — take N workers at a time: mark `Draining` (existing
-  status: excluded from selection, in-flight completes) → `wait_idle` →
-  update → flip → re-admit → next batch. Zero rollout downtime; produces
-  bounded version skew, which is why routing mode `max-staleness` exists.
-- `blue-green(fraction)` — pre-flip a fraction to the new version while the
-  rest serve; new rollouts route `latest-only`; old cohort drains then
-  updates. The "drain-and-flip" from the brainstorm: fresh rollouts start on
-  new weights immediately, long-tail requests finish on old weights, and
-  every response is stamped so the trainer knows which is which.
-- Partial-rollout interplay: with `abort_partials: true` the quiesce step
-  returns partials to clients (`finish_reason=abort`); clients resubmit and
-  cache-aware routing lands them on updated workers. SMG does not buffer
-  rollout state server-side in v1 (see Open Questions).
+A weight update is a short, ordered sequence the gateway runs as a workflow
+(built on SMG's existing step engine). The gateway sequences and verifies the
+steps; it never carries weight tensors — those move directly between the trainer
+and the workers over NCCL, shared memory, or a checkpoint store.
+
+The sequence for one group (or one cohort of a rolling update):
+
+```mermaid
+sequenceDiagram
+  actor Trainer
+  participant API as Rollout control API
+  participant Orch as Update orchestrator
+  participant Reg as Version registry
+  participant W as Worker(s)
+
+  Trainer->>API: start weight update (target, source, strategy)
+  API->>Orch: create update
+  opt approval required
+    Orch-->>Trainer: waiting for approval
+    Trainer->>API: approve (second person)
+  end
+  Orch->>Reg: mark workers "updating" (routing skips them)
+  Orch->>W: pause generation, wait until idle
+  Orch-->>Trainer: waiting for transfer
+  Trainer->>W: send new weights (NCCL / shared memory / checkpoint)
+  Trainer->>API: transfer complete
+  Orch->>W: apply weights, clear prompt cache, verify version
+  Orch->>Reg: set version = target, mark "serving"
+  Orch->>W: resume generation
+  Note over Orch,Reg: rolling / gradual strategies repeat this per cohort
+```
+
+For a co-located setup (the trainer shares the same GPUs), two extra steps
+bracket the transfer: before it, the workers **release GPU memory** so the
+trainer's step can use the GPU; after it, they **restore GPU memory** in two
+stages — weights first, then prompt cache — to avoid running out of memory.
+
+**Update strategies.** How much of the group is taken offline at once:
+
+| Strategy | What happens | Rollout availability | When to use |
+|---|---|---|---|
+| `all-at-once` | the whole group stops, updates, then resumes | none during the update | small groups; simplest; matches what teams hand-roll today |
+| `rolling` | a few workers at a time (`workers_at_a_time`) | continuous | the default for large groups; brief, bounded version spread across workers |
+| `gradual-cutover` | both versions serve at once; new rollouts prefer the new version while the old one drains | continuous, with no version mixing inside a single request | when fresh rollouts should start on new weights immediately and running two versions briefly is acceptable |
+
+With `rolling` and `gradual-cutover`, workers legitimately sit at different
+versions for a while — which is exactly why version stamping and version-aware
+routing exist, and why `within-staleness-limit` lets the trainer bound how far
+behind a served request may be.
+
+The partial-rollout case: if the update quiesces with
+`in_flight: "cancel-and-return-partial"`, in-progress rollouts return the tokens
+generated so far; the trainer's client resubmits them, and cache-aware routing
+places the continuation on a worker that already holds the prefix. The gateway
+does not store rollout state itself in v1 (see Risks).
 
 **Failure handling:**
 
 - Any step failure → worker goes `Failed` + version-quarantined (never
   routable at `latest-only`), workflow continues with the rest, terminal
   report lists per-worker outcomes. This mirrors and fixes the slime
-  pain points (no more fleet-wide stuck-paused states: pause/continue are
+  pain points (no more whole-group stuck-paused states: pause and resume are
   issued and *verified* per worker, with retries and a reconciliation sweep).
 - `KvCacheCleared` events (already consumed by `KvEventMonitor`) are used as
   independent confirmation that a worker's cache actually flushed during an
@@ -524,43 +632,136 @@ Strategies (per update job, `strategy` field):
   interop point: SMG triggers `ParameterServer.update(ranks=[...])`-style
   joins; it never moves tensors.
 
-### 4. RL control API (`/v1/rl/*`, control-plane auth)
+### 4. Rollout control API
 
+Everything is under `/v1/rollout/` and requires control-plane authentication
+with the RL capabilities defined in Security (M1). Names are chosen to read as
+instructions; every noun is defined in Terminology.
+
+**Rollout groups**
+
+| Method and path | Purpose |
+|---|---|
+| `POST /v1/rollout/groups` | Create a rollout group from a list of workers or a label selector. |
+| `GET /v1/rollout/groups` | List groups. |
+| `GET /v1/rollout/groups/{group}` | Read a group's status, including each worker's weight version and state. |
+| `DELETE /v1/rollout/groups/{group}` | Remove the group (the workers themselves stay registered). |
+
+**Generation control** (applied to every worker in the group, then verified per worker)
+
+| Method and path | Purpose |
+|---|---|
+| `POST /v1/rollout/groups/{group}/pause-generation` | Stop scheduling new rollouts; choose what happens to in-flight ones. |
+| `POST /v1/rollout/groups/{group}/resume-generation` | Resume scheduling. |
+| `POST /v1/rollout/groups/{group}/cancel-in-flight` | End in-flight rollouts now; partial output is returned to callers. |
+| `POST /v1/rollout/groups/{group}/release-gpu-memory` | Have workers free GPU memory (weights and/or prompt cache) for a co-located trainer. |
+| `POST /v1/rollout/groups/{group}/restore-gpu-memory` | Reverse of release. |
+| `POST /v1/rollout/groups/{group}/clear-cache` | Clear the prompt cache across the group. |
+
+**Weight updates**
+
+| Method and path | Purpose |
+|---|---|
+| `POST /v1/rollout/groups/{group}/weight-updates` | Start a weight update; returns an `update_id`. |
+| `GET /v1/rollout/weight-updates/{update}` | Read progress: phase and per-worker outcome. |
+| `POST /v1/rollout/weight-updates/{update}/approve` | Grant the second-person approval, when the update requires one. |
+| `POST /v1/rollout/weight-updates/{update}/transfer-complete` | The trainer signals it has finished sending the new weights. |
+| `POST /v1/rollout/weight-updates/{update}/cancel` | Stop the update and return the group to a consistent state. |
+| `GET /v1/rollout/groups/{group}/weight-version-history` | Who promoted which version, when, and from which checkpoint. |
+
+**One rollout at a time**
+
+| Method and path | Purpose |
+|---|---|
+| `POST /v1/rollout/requests/{request-id}/cancel` | Cancel a single in-flight rollout by id, where the engine supports it. |
+
+**Request shapes.** The fields a human — or a coding assistant — fills in:
+
+Create a group:
+
+```json
+{
+  "name": "policy-qwen3-run42",
+  "model": "qwen3-8b",
+  "role": "policy",
+  "members": { "worker_urls": ["http://gpu1:8000", "http://gpu2:8000"] },
+  "weight_version_routing": "latest-only"
+}
 ```
-POST   /v1/rl/fleets                          define fleet {model, role, workers|selector}
-GET    /v1/rl/fleets/{fleet}                  state incl. per-worker versions
-POST   /v1/rl/fleets/{fleet}/pause            {mode}          fan-out + verify
-POST   /v1/rl/fleets/{fleet}/resume
-POST   /v1/rl/fleets/{fleet}/abort            {scope: all}    returns per-worker counts
-POST   /v1/rl/fleets/{fleet}/sleep            {tags}
-POST   /v1/rl/fleets/{fleet}/wake             {tags}
-POST   /v1/rl/fleets/{fleet}/flush_kv
-POST   /v1/rl/fleets/{fleet}/updates          start update job:
-        { target_version, method: disk|tensor|distributed|external,
-          strategy: all-at-once|rolling|blue-green, params: {...},
-          abort_partials: bool }
-GET    /v1/rl/updates/{job}                   step-level progress (workflow events)
-POST   /v1/rl/updates/{job}/proceed           trainer-side barrier release
-DELETE /v1/rl/updates/{job}                   cancel → reconcile to consistent state
-GET    /v1/rl/versions/{model}                version registry view
+
+Pause generation:
+
+```json
+{ "in_flight": "cancel-and-return-partial" }
 ```
 
-Notes:
+Start a weight update:
 
-- Update jobs ride the `JobQueue` → workflow engine path; `GET` progress is
-  served from workflow `EventBus` subscriptions (step-level granularity
-  exists today).
-- For `method: distributed`, the job body carries the NCCL rendezvous
-  (`master_address`, `master_port`, `world_size`, `group_name`, per-worker
-  `rank_offset` assignments) — SMG computes and distributes rank offsets
-  across the fleet, which every framework currently hand-computes.
-- For `method: external` (checkpoint-engine or trainer-driven transfers), SMG
-  only does quiesce/flip/verify around a trainer-signaled window — the
-  minimal-trust mode frameworks can adopt first.
-- Per-request abort (`POST /v1/rl/requests/{rid}/abort`) is included for
-  engines that support it (SGLang `rid`; vLLM via tracked-connection drop
-  using the existing `AbortOnDropStream`/inflight tracker) — closing the gap
-  verl asks for in [verl#6866](https://github.com/volcengine/verl/issues/6866).
+```json
+{
+  "target_weight_version": "step-4200",
+  "weight_source": "training-broadcast",
+  "update_strategy": "rolling",
+  "workers_at_a_time": 2,
+  "in_flight": "cancel-and-return-partial",
+  "provenance": { "checkpoint_digest": "sha256:...", "signature": "..." },
+  "requires_approval": true
+}
+```
+
+`weight_source` says where the new weights come from:
+
+| Value | Meaning |
+|---|---|
+| `checkpoint-path` | Workers load the weights from a file path or object store (add `checkpoint_path`). |
+| `training-broadcast` | The trainer broadcasts weights over NCCL; the gateway opens the channel and assigns each worker its rank (add `training_process` with the rendezvous host, port, and world size). |
+| `shared-memory` | Trainer and worker share a GPU; weights pass by handle, with no copy (co-located setups). |
+| `trainer-managed` | The trainer moves the weights entirely on its own; the gateway only quiesces, verifies, and flips the version around a window the trainer opens and closes. This is the lowest-trust option and the easiest to adopt first. |
+
+The start-update response and the status endpoint share one shape:
+
+```json
+{
+  "update_id": "upd_01H...",
+  "group": "policy-qwen3-run42",
+  "target_weight_version": "step-4200",
+  "strategy": "rolling",
+  "phase": "waiting-for-transfer",
+  "worker_ranks": { "http://gpu1:8000": 1, "http://gpu2:8000": 2 },
+  "workers": [
+    { "worker": "http://gpu1:8000", "weight_version": "step-4200", "state": "serving" },
+    { "worker": "http://gpu2:8000", "weight_version": "step-4100", "state": "updating" }
+  ],
+  "approval": { "required": true, "granted_by": "alice@corp", "granted_at": "..." }
+}
+```
+
+An update moves through a fixed set of phases, which the trainer can poll or
+receive by webhook:
+
+```mermaid
+flowchart LR
+  A[waiting-for-approval] --> B[quiescing]
+  B --> C[waiting-for-transfer]
+  C --> D[applying]
+  D --> E[verifying]
+  E --> F[completed]
+  B -.-> X[failed / cancelled]
+  D -.-> X
+  E -.-> X
+```
+
+Design notes:
+
+- Updates run on SMG's existing background-job and workflow machinery; progress
+  comes from the workflow's own step events.
+- For `training-broadcast`, the gateway computes each worker's rank and returns
+  the assignment, so the trainer does not have to — every framework hand-writes
+  this today.
+- `trainer-managed` is the minimal-trust entry point: the gateway sequences and
+  verifies but touches none of the transfer mechanics.
+- Per-rollout cancel closes a gap frameworks ask for today (they can currently
+  cancel only a whole replica).
 
 ### 5. Data-plane extensions
 
@@ -591,12 +792,13 @@ Notes:
 
 ### 6. Protocol / crate changes
 
-- `crates/protocols`: `WorkerSpec { rl_role }`, `WeightUpdateSpec`,
-  `NcclRendezvous`, `RlCapabilities`, update-job types; extend
-  `GenerateRequest` with `return_routed_experts`.
-- `crates/grpc_client` protos: add `Pause`, `Resume`, `ReleaseMemory`,
-  `ResumeMemory`, `UpdateWeights{Disk,Tensor,Distributed}`,
-  `InitWeightTransferGroup` RPCs to `common.proto` / per-engine protos,
+- `crates/protocols`: `WorkerSpec { rl_role }`, `WeightSource`,
+  `TransferRendezvous`, `EngineCapabilities`, and the group / update-job
+  types; extend `GenerateRequest` with `return_routed_experts`.
+- `crates/grpc_client` protos: add `PauseGeneration`, `ResumeGeneration`,
+  `ReleaseGpuMemory`, `RestoreGpuMemory`, `ApplyWeights{FromDisk,FromTensor,
+  FromDistributed}`, and `OpenWeightChannel` RPCs to `common.proto` /
+  per-engine protos,
   implemented first in the SGLang servicer and TokenSpeed (co-design), HTTP
   fallback elsewhere. Note (verified): no engine proto's `GenerateComplete`
   carries `weight_version` — today SMG synthesizes the response stamp from
@@ -608,7 +810,7 @@ Notes:
 - `model_gateway`: `EngineControl` impls on `BasicWorker` (dual dispatch like
   `flush_cache`); `WeightVersionRegistry` (+ mesh adapter — the mesh adapter
   pattern in `mesh/adapters/` has three existing exemplars to follow);
-  workflow steps + `create_fleet_weight_update_workflow`; `/v1/rl/*` routes;
+  workflow steps + `create_weight_update_workflow`; `/v1/rollout/*` routes;
   rollout traffic mapped to the existing `Bulk` priority class (see §5);
   version-aware filtering in `get_healthy_worker_indices` (one added
   predicate, policy-agnostic). Version flips MUST go through the registry's
@@ -627,7 +829,7 @@ Thin shims, in adoption-priority order:
 1. **slime** — zero-code path: SMG already accepts sgl-router worker CRUD and
    `/generate`; validate with `--sglang-router-ip/port` pointed at SMG, then
    contribute an optional "gateway-managed update" mode to slime that replaces
-   its bypass-and-poll drain with one `/v1/rl/fleets/{f}/updates` call.
+   its bypass-and-poll drain with one `/v1/rollout/fleets/{f}/updates` call.
 2. **verl** — publish `smg.verl.SmgServerClient` implementing
    `LLMServerClient.generate() -> TokenOutput` (maps `stop_reason`,
    `log_probs`, `routed_experts`, stamps `global_steps` from SMG's version
@@ -743,10 +945,11 @@ pre-existing bugs):
 ### Day-one design constraints (must be in the RFC before Phase 1)
 
 - **M1 — Scoped RL capabilities, not `is_admin()`.** Add capability claims
-  `rl:observe` / `rl:operate` (pause/resume/abort/sleep/wake/flush) /
+  `rl:observe` / `rl:operate` (pause / resume / cancel-in-flight /
+  release-gpu-memory / restore-gpu-memory / clear-cache) /
   `rl:update-weights` / `rl:promote` / `rl:approve`, each bound to a **fleet
   selector**, enforced by a `check_rl_capability(principal, fleet, verb)` gate
-  ahead of every `/v1/rl/*` handler. Without this, co-tenancy (P6) is a
+  ahead of every `/v1/rollout/*` handler. Without this, co-tenancy (P6) is a
   privilege-escalation surface.
 - **M2 — Provenance-verified, approval-gated weight updates.** `WeightUpdateSpec`
   carries `{artifact_digest, signature, signer_identity}`; SMG verifies bytes
@@ -754,7 +957,8 @@ pre-existing bugs):
   (OpenSSF Model Signing / sigstore / internal KMS), constrained to a
   per-fleet **checkpoint allow-list** of path prefixes / registry URIs. A
   config-selectable **two-person rule** for `method: disk|distributed|external`
-  reuses the existing `proceed` barrier as the `rl:approve` join point. This
+  reuses the same barrier mechanism as `transfer-complete` as the `rl:approve`
+  join point. This
   turns "arbitrary model replacement" into "verified, allow-listed, dual-
   controlled promotion."
 - **M3 — Provenance-carrying, tamper-evident audit.** Extend `AuditEvent` with
@@ -785,7 +989,7 @@ pre-existing bugs):
   mesh mutual auth is real, the registry is **single-writer-authoritative**,
   not gossip-converged.
 - **M7 — Tenant-scoped control-plane objects.** Every fleet / version /
-  update-job / trajectory has an owning tenant; `/v1/rl/*` gets tenant
+  update-job / trajectory has an owning tenant; `/v1/rollout/*` gets tenant
   resolution (today no tenant middleware touches admin routes); audit and
   version views are per-tenant partitioned; trajectory columns carry the
   owning tenant and enforce read authz. If deferred, the RFC must state that
@@ -824,7 +1028,8 @@ sharing) beyond M8's default partitioning.
   rollout-grade today."
 - **Phase 1 — control verbs + authz foundation (medium)**: `EngineControl`
   trait + SGLang/vLLM adapters; fleet fan-out endpoints
-  (pause/resume/abort/sleep/wake/flush) with per-worker verification;
+  (pause / resume / cancel-in-flight / release- and restore-gpu-memory /
+  clear-cache) with per-worker verification;
   **scoped RL capabilities (M1)** and the **network trust model (M4, M5)**
   land here, not later — they are the gate on exposing any control verb.
   Immediately fixes slime's bypass loop and the sglang#6531/#21235-class
@@ -887,7 +1092,7 @@ and Phase 1 deliver standalone value before it closes.
 3. **Trainer-side rendezvous trust.** For `method: distributed`, SMG
    distributes NCCL rendezvous info but cannot verify the transfer happened
    correctly; we rely on engine-reported versions (`get_weight_version`) and
-   the trainer's `proceed` barrier. Optional `weights_checker`-style probes
+   the trainer's `transfer-complete` signal. Optional `weights_checker`-style probes
    (hash a sentinel tensor via a designated endpoint) are a Phase 2 stretch.
 4. **Server-side partial-rollout brokerage** (gateway buffers aborted
    trajectories and re-issues them, rather than clients): deferred. It

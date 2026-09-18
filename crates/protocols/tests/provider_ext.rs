@@ -1405,3 +1405,105 @@ fn non_k3_models_ignore_thinking_effort_values() {
         );
     }
 }
+
+#[expect(clippy::expect_used, reason = "test helper")]
+fn effective_tool_names(value: Value) -> Vec<String> {
+    let req: ChatCompletionRequest = serde_json::from_value(value).expect("request deserializes");
+    req.effective_tools()
+        .map(|tool| tool.function.name.clone())
+        .collect()
+}
+
+#[test]
+fn effective_tools_merge_request_and_dynamic_tools() {
+    let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {"type": "object"}}});
+
+    // Request-level tools come first, then dynamic tools in message order.
+    let merged = effective_tool_names(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("dynamic_a")]},
+            {"role": "user", "content": "hi"},
+            {"role": "developer", "content": "", "tools": [tool("dynamic_b")]}
+        ],
+        "tools": [tool("global")]
+    }));
+    assert_eq!(merged, ["global", "dynamic_a", "dynamic_b"]);
+
+    // Dynamic tools alone are still tools.
+    let dynamic_only = effective_tool_names(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("get_weather")]},
+            {"role": "user", "content": "weather?"}
+        ]
+    }));
+    assert_eq!(dynamic_only, ["get_weather"]);
+
+    // Tools on other roles are not part of the set.
+    let none = effective_tool_names(json!({
+        "model": "kimi-k3",
+        "messages": [{"role": "user", "content": "hi"}]
+    }));
+    assert!(none.is_empty());
+}
+
+#[expect(clippy::expect_used, reason = "test helper")]
+fn callable_tool_names(value: Value) -> Vec<String> {
+    let req: ChatCompletionRequest = serde_json::from_value(value).expect("request deserializes");
+    req.callable_tools()
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect()
+}
+
+#[test]
+fn callable_tools_follow_tool_choice_across_request_and_dynamic_tools() {
+    let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {"type": "object"}}});
+
+    // `required` keeps every tool: request-level first, then dynamic.
+    let required = callable_tool_names(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("get_weather")]},
+            {"role": "user", "content": "what is the weather in beijing?"}
+        ],
+        "tools": [tool("get_stock_price")],
+        "tool_choice": "required"
+    }));
+    assert_eq!(required, ["get_stock_price", "get_weather"]);
+
+    // A named choice narrows dynamic tools the same way as request-level ones.
+    let named = callable_tool_names(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("get_weather"), tool("get_time")]},
+            {"role": "user", "content": "what time is it?"}
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "get_time"}}
+    }));
+    assert_eq!(named, ["get_time"]);
+
+    // `allowed_tools` keeps the listed functions from either origin.
+    let allowed = callable_tool_names(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "developer", "content": "", "tools": [tool("get_weather")]},
+            {"role": "user", "content": "hi"}
+        ],
+        "tools": [tool("get_stock_price"), tool("get_news")],
+        "tool_choice": {"type": "allowed_tools", "mode": "required", "tools": [
+            {"type": "function", "name": "get_news"},
+            {"type": "function", "name": "get_weather"}
+        ]}
+    }));
+    assert_eq!(allowed, ["get_news", "get_weather"]);
+
+    // No tools anywhere: nothing the choice could force.
+    let none = callable_tool_names(json!({
+        "model": "kimi-k3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tool_choice": "auto"
+    }));
+    assert!(none.is_empty());
+}

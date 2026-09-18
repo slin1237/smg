@@ -471,27 +471,7 @@ pub(crate) fn filter_tools_by_tool_choice(
     tools: &[Tool],
     tool_choice: Option<&ToolChoice>,
 ) -> Option<Vec<Tool>> {
-    match tool_choice {
-        Some(ToolChoice::AllowedTools { tools: allowed, .. }) => {
-            let allowed_names: std::collections::HashSet<&str> =
-                allowed.iter().filter_map(|t| t.function_name()).collect();
-            let filtered: Vec<Tool> = tools
-                .iter()
-                .filter(|t| allowed_names.contains(t.function.name.as_str()))
-                .cloned()
-                .collect();
-            Some(filtered)
-        }
-        Some(ToolChoice::Function { function, .. }) => {
-            let filtered: Vec<Tool> = tools
-                .iter()
-                .filter(|t| t.function.name == function.name)
-                .cloned()
-                .collect();
-            Some(filtered)
-        }
-        _ => None, // No filtering needed
-    }
+    tool_choice.and_then(|choice| choice.narrow_tools(tools))
 }
 
 /// Filter ChatCompletionRequest by tool_choice

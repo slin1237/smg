@@ -9,6 +9,7 @@ use std::collections::HashSet;
 
 use crate::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent, ThinkingType},
+    common::Tool,
     ext::kimi::DeclaredTools,
 };
 
@@ -56,6 +57,27 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
         validate_thinking(req)?;
     }
     validate_message_tools(req)
+}
+
+/// K3 dynamic tools: the tools declared on system and developer messages, in
+/// message order. They stand next to the request-level `tools` everywhere a
+/// tool name is resolved after validation (the response spec, tool-call
+/// parsing, the `tool_choice` constraint). Malformed declarations are
+/// [`validate_message_tools`]'s business and are skipped here.
+pub(super) fn dynamic_tools(req: &ChatCompletionRequest) -> impl Iterator<Item = &Tool> {
+    req.messages.iter().flat_map(|message| match message {
+        ChatMessage::System { ext, .. } => ext
+            .tools
+            .as_ref()
+            .and_then(DeclaredTools::typed)
+            .unwrap_or_default(),
+        ChatMessage::Developer { ext, .. } => ext
+            .tools
+            .as_ref()
+            .and_then(DeclaredTools::typed)
+            .unwrap_or_default(),
+        _ => &[],
+    })
 }
 
 /// K3 dynamic tools (KVV test_dynamic_tools): rejected on user/assistant; on system

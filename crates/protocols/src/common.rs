@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{
     de::{self, value::SeqAccessDeserializer, SeqAccess, Visitor},
@@ -441,6 +441,36 @@ impl ToolChoice {
         tool_choice
             .map(|tc| serde_json::to_string(tc).unwrap_or_else(|_| "auto".to_string()))
             .unwrap_or_else(|| "auto".to_string())
+    }
+
+    /// The subset of `tools` this choice lets the model call, in the original
+    /// order: the named function for the function form, the listed functions
+    /// for `allowed_tools`. `None` when the choice does not narrow the list
+    /// (`auto`, `none`, `required`).
+    pub fn narrow_tools(&self, tools: &[Tool]) -> Option<Vec<Tool>> {
+        match self {
+            ToolChoice::AllowedTools { tools: allowed, .. } => {
+                let allowed: HashSet<&str> = allowed
+                    .iter()
+                    .filter_map(ToolReference::function_name)
+                    .collect();
+                Some(
+                    tools
+                        .iter()
+                        .filter(|tool| allowed.contains(tool.function.name.as_str()))
+                        .cloned()
+                        .collect(),
+                )
+            }
+            ToolChoice::Function { function, .. } => Some(
+                tools
+                    .iter()
+                    .filter(|tool| tool.function.name == function.name)
+                    .cloned()
+                    .collect(),
+            ),
+            ToolChoice::Value(_) => None,
+        }
     }
 }
 

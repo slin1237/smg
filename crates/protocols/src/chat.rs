@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     builders::{ChatCompletionResponseBuilder, ChatCompletionStreamResponseBuilder},
-    ext::kimi::{DeclaredTools, KimiAssistantExt, KimiDeveloperExt, KimiSystemExt, KimiUserExt},
+    ext::kimi::{KimiAssistantExt, KimiDeveloperExt, KimiSystemExt, KimiUserExt},
     profile::ProviderProfile,
     validated::Normalizable,
 };
@@ -547,23 +547,8 @@ fn validate_chat_cross_parameters(
         // declared on system and developer messages (Kimi K3). Both the
         // "are there tools" decision and the named-choice checks below use
         // it, so a name is resolved against everything the model will see.
-        let dynamic_tools = || {
-            req.messages.iter().flat_map(|m| match m {
-                ChatMessage::System { ext, .. } => ext
-                    .tools
-                    .as_ref()
-                    .and_then(DeclaredTools::typed)
-                    .unwrap_or_default(),
-                ChatMessage::Developer { ext, .. } => ext
-                    .tools
-                    .as_ref()
-                    .and_then(DeclaredTools::typed)
-                    .unwrap_or_default(),
-                _ => &[],
-            })
-        };
         // Lazy on purpose: most tool traffic only needs the emptiness check.
-        let effective_tools = || req.tools.iter().flatten().chain(dynamic_tools());
+        let effective_tools = || req.effective_tools();
         let has_tools = effective_tools().next().is_some();
 
         let requires_tools = !matches!(
@@ -661,6 +646,35 @@ fn validate_chat_cross_parameters(
     ProviderProfile::for_model(&req.model).validate_chat(req)?;
 
     Ok(())
+}
+
+impl ChatCompletionRequest {
+    /// Tools declared on messages rather than at the request level, as the
+    /// request's provider profile defines them (Kimi K3 dynamic tools on
+    /// system and developer messages; see [`ProviderProfile::dynamic_tools`]).
+    pub fn dynamic_tools(&self) -> impl Iterator<Item = &Tool> {
+        ProviderProfile::for_model(&self.model).dynamic_tools(self)
+    }
+
+    /// Every tool the model will see: the request-level `tools` followed by
+    /// the dynamic tools. Anything that resolves a tool name in the response,
+    /// tool-call parsing first of all, must work from this set rather than
+    /// from `tools` alone, or a call to a dynamic tool comes back as text.
+    pub fn effective_tools(&self) -> impl Iterator<Item = &Tool> {
+        self.tools.iter().flatten().chain(self.dynamic_tools())
+    }
+
+    /// The tools a `tool_choice` may force: [`Self::effective_tools`] narrowed
+    /// by the choice (see [`ToolChoice::narrow_tools`]). A `tool_choice`
+    /// grammar must be built from this set; built from `tools` alone, a
+    /// forced call could only ever land on a request-level tool.
+    pub fn callable_tools(&self) -> Vec<Tool> {
+        let tools: Vec<Tool> = self.effective_tools().cloned().collect();
+        self.tool_choice
+            .as_ref()
+            .and_then(|choice| choice.narrow_tools(&tools))
+            .unwrap_or(tools)
+    }
 }
 
 // ============================================================================

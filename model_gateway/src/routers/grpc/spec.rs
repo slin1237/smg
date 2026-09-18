@@ -86,7 +86,12 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
         Self {
             separate_reasoning: request.separate_reasoning,
             tool_choice: request.tool_choice.clone(),
-            tools: request.tools.clone(),
+            // Every tool the model may call, dynamic tools declared on messages
+            // included; `None` only when the request declares no tools anywhere.
+            tools: {
+                let tools: Vec<Tool> = request.effective_tools().cloned().collect();
+                (request.tools.is_some() || !tools.is_empty()).then_some(tools)
+            },
             history_tool_calls_count: utils::get_history_tool_calls_count(request),
             stream_options: request.stream_options.clone(),
             chat_template_kwargs: request.chat_template_kwargs.clone(),
@@ -224,4 +229,73 @@ impl From<&CompletionRequest> for CompletionResponseSpec {
 pub(crate) enum HarmonyResponseSpec {
     Chat(Arc<ChatCompletionRequest>),
     Responses(Arc<ResponsesRequest>),
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn chat_request(value: Value) -> ChatCompletionRequest {
+        serde_json::from_value(value).expect("request deserializes")
+    }
+
+    fn tool(name: &str) -> Value {
+        json!({
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object", "properties": {}}}
+        })
+    }
+
+    fn tool_names(spec: &ChatResponseSpec) -> Vec<String> {
+        spec.tools
+            .iter()
+            .flatten()
+            .map(|tool| tool.function.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn chat_spec_tools_include_dynamic_tools() {
+        let request = chat_request(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "content": "", "tools": [tool("get_weather")]},
+                {"role": "user", "content": "what is the weather in beijing?"}
+            ],
+            "tool_choice": "required"
+        }));
+
+        let spec = ChatResponseSpec::from(&request);
+
+        assert_eq!(tool_names(&spec), ["get_weather"]);
+    }
+
+    #[test]
+    fn chat_spec_tools_keep_request_tools_first() {
+        let request = chat_request(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "content": "", "tools": [tool("dynamic_a")]},
+                {"role": "user", "content": "hi"},
+                {"role": "developer", "content": "", "tools": [tool("dynamic_b")]}
+            ],
+            "tools": [tool("global")]
+        }));
+
+        let spec = ChatResponseSpec::from(&request);
+
+        assert_eq!(tool_names(&spec), ["global", "dynamic_a", "dynamic_b"]);
+    }
+
+    #[test]
+    fn chat_spec_tools_none_without_any_declaration() {
+        let request = chat_request(json!({
+            "model": "kimi-k3",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+
+        assert!(ChatResponseSpec::from(&request).tools.is_none());
+    }
 }

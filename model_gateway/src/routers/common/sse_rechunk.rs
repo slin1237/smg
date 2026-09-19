@@ -1,567 +1,854 @@
-//! SSE delta re-chunking for provider stream-QoS contracts.
+//! Re-slicing of streamed chat completion deltas.
 //!
-//! MiniMax's vendor verifier bounds the per-event payload-size distribution
-//! (m3_stream_tests: ≤5–15% events of 1–4 chars, ≤0–2% events over 200 chars,
-//! bounded large-event character share). Upstreams routinely violate both
-//! directions — token-sized dribbles and multi-kilobyte argument dumps — so
-//! the relay absorbs delta payload strings into per-field buffers and
-//! re-emits events sized between the tiny and large bounds. Structural events
-//! (role, tool-call identity, finish_reason, usage, shapes this module does
-//! not merge) flush pending payload first and pass through in order.
+//! MiniMax's provider verifier checks the size of every streamed delta:
+//! almost none may be shorter than five characters or longer than two
+//! hundred. Engines emit one token per event and tool arguments in one
+//! piece, so the gateway buffers `content`, `reasoning_content`, `reasoning`
+//! and tool-call `arguments` and emits them again in moderate slices. Text is
+//! only held back briefly: the relays flush it when the upstream has been
+//! quiet for [`IDLE_FLUSH`].
 //!
-//! Re-chunking trades a little time to first token for packet-size
-//! compliance; the relay flushes pending payload when the upstream goes idle.
-//! Single-choice chat streams only: a second choice, `[DONE]`, or an
-//! unterminated frame past `MAX_FRAME_BYTES` switches the rest of the stream
-//! to byte pass-through, and a chunk carrying choice metadata such as
-//! `logprobs` is forwarded whole, so a stream that requests logprobs is not
-//! re-chunked in practice.
+//! Only single-choice chat completion streams are re-sliced. Everything else
+//! is forwarded as it came, after any buffered text so the order never
+//! changes: comments, `[DONE]`, malformed frames, events with several
+//! choices, events carrying `logprobs` or fields this module does not know.
 //!
-//! Two relays use it: the HTTP proxy drives [`SseRechunker`] inline over the
-//! upstream body, and the gRPC pipeline wraps the frames it encodes itself in
-//! [`rechunk_stream`].
+//! The HTTP relay drives [`SseRechunker`] inline; the gRPC pipeline wraps
+//! its own channel in [`rechunk_stream`].
 
-use std::{collections::BTreeMap, pin::Pin, time::Duration};
+use std::{borrow::Cow, collections::BTreeMap, fmt, pin::Pin, time::Duration};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use serde_json::{Map, Value};
+use serde::{
+    de::{self, MapAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
+use serde_json::value::RawValue;
 
-/// Emit buffered payload in slices of this many chars once at least
-/// `EMIT_THRESHOLD` chars are pending; both sit safely inside the contract's
-/// normal band of 5–200 chars per event.
+/// Slices hold at most `SLICE_CHARS` characters and are cut once at least
+/// `EMIT_THRESHOLD` are buffered. A cut never leaves a tail shorter than
+/// `MIN_TAIL_CHARS`, so only a delta that is tiny in total yields a tiny event.
 const SLICE_CHARS: usize = 160;
 const EMIT_THRESHOLD: usize = 80;
-/// A split never leaves a tail shorter than this, so only a payload that is
-/// tiny in total can produce a tiny event.
 const MIN_TAIL_CHARS: usize = 5;
 
-/// Largest unterminated frame held back while waiting for its delimiter.
+/// An unterminated frame longer than this is forwarded as it comes.
 const MAX_FRAME_BYTES: usize = 1 << 20;
 
-/// Delta string fields subject to re-chunking, in emission order.
+/// Delta fields whose text is buffered, in the order they are emitted.
 const PAYLOAD_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "content"];
 
-/// Pending re-chunked payload is flushed after this much upstream silence,
-/// so packet sizing never holds a slow stream's first token.
+/// Buffered text is flushed after this much upstream silence.
 pub(crate) const IDLE_FLUSH: Duration = Duration::from_millis(250);
 
-/// One re-chunked payload buffer.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Buffer {
-    Field(&'static str),
-    /// `None` when the upstream sent no `index`; the fragment is then emitted
-    /// without one rather than attributed to call 0.
-    ToolArgs(Option<u64>),
-}
-
-/// What one upstream event carried besides its payload.
-struct Absorbed {
-    /// Announces something later payload attaches to (role, tool identity).
-    opens: bool,
-    /// Must follow every earlier payload (finish_reason, usage, unknown keys).
-    closes: bool,
-    payload: Vec<(Buffer, String)>,
-}
-
+/// Re-slices the deltas of one SSE stream: feed it the body chunks in order
+/// and forward what it returns.
 #[derive(Default)]
 pub struct SseRechunker {
-    raw: Vec<u8>,
-    /// Bytes of `raw` already searched for a delimiter.
+    /// Start of a frame whose delimiter has not arrived yet.
+    partial: Vec<u8>,
+    /// Bytes of `partial` already searched for a delimiter.
     scanned: usize,
-    /// Envelope of the latest chat chunk (top-level fields minus choices/usage).
-    envelope: Map<String, Value>,
-    /// Buffered payload per delta string field.
-    fields: BTreeMap<&'static str, String>,
-    /// Buffered tool-call `arguments` per tool index.
-    tool_args: BTreeMap<Option<u64>, String>,
-    /// The buffer that received payload last; switching flushes it first.
-    last: Option<Buffer>,
+    /// Top-level fields of the latest event except `choices` and `usage`,
+    /// serialized as the start of an object (`{"id":"x",`), so synthesized
+    /// events look like the upstream ones.
+    envelope: Vec<u8>,
+    scratch: Vec<u8>,
+    fields: [Pending; PAYLOAD_FIELDS.len()],
+    tool_args: BTreeMap<Option<u64>, Pending>,
+    /// The buffer that received text last. Text for another buffer flushes
+    /// it first, so the stream order is kept.
+    last: Option<Slot>,
     role_sent: bool,
-    /// Forward bytes verbatim from here on.
+    /// Forward everything verbatim from here on.
     passthrough: bool,
-    /// Events forwarded whole because of delta or choice keys this module does not merge.
-    unknown_events: usize,
+    forwarded_unknown: usize,
+}
+
+/// Text waiting to be emitted, with its length in characters kept current
+/// so every event does not rescan the buffer.
+#[derive(Default)]
+struct Pending {
+    text: String,
+    chars: usize,
+}
+
+/// Which buffer a piece of text belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    /// Position in `PAYLOAD_FIELDS`.
+    Field(usize),
+    /// Tool-call `index`; `None` when the upstream sent none, so the
+    /// fragments are emitted without one rather than attributed to call 0.
+    ToolArgs(Option<u64>),
 }
 
 impl SseRechunker {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            envelope: b"{".to_vec(),
+            ..Self::default()
+        }
     }
 
-    /// Ingest one upstream body chunk, returning the bytes to forward now.
-    pub fn feed(&mut self, chunk: &[u8]) -> Bytes {
+    /// Takes one body chunk and returns the bytes to forward now.
+    pub fn feed(&mut self, chunk: Bytes) -> Bytes {
         if self.passthrough {
-            return Bytes::copy_from_slice(chunk);
+            return chunk;
         }
-        self.raw.extend_from_slice(chunk);
-        let raw = std::mem::take(&mut self.raw);
         let mut out = Vec::new();
-        let mut cursor = 0;
-        // Resume the search where it stopped, overlapping a split delimiter.
-        let mut from = self.scanned.saturating_sub(3);
-        while let Some((end, delimiter)) = find_frame_end(&raw, cursor + from) {
-            let frame_end = end + delimiter;
-            self.handle_frame(&raw[cursor..frame_end], &mut out);
-            cursor = frame_end;
-            from = 0;
-            if self.passthrough {
-                out.extend_from_slice(&raw[cursor..]);
-                cursor = raw.len();
-                break;
-            }
+        if self.partial.is_empty() {
+            let rest = self.consume(&chunk, 0, &mut out);
+            self.partial.extend_from_slice(rest);
+        } else {
+            self.partial.extend_from_slice(&chunk);
+            let mut buffered = std::mem::take(&mut self.partial);
+            let consumed = {
+                let rest = self.consume(&buffered, self.scanned, &mut out);
+                buffered.len() - rest.len()
+            };
+            buffered.drain(..consumed);
+            self.partial = buffered;
         }
-        if !self.passthrough && raw.len() - cursor > MAX_FRAME_BYTES {
-            // An event this large is not worth holding back: relay it as it comes.
-            self.flush_payload(&mut out);
-            out.extend_from_slice(&raw[cursor..]);
-            cursor = raw.len();
+        if self.partial.len() > MAX_FRAME_BYTES {
+            self.flush(&mut out);
+            out.append(&mut self.partial);
             self.passthrough = true;
         }
-        self.scanned = raw.len() - cursor;
-        self.raw = raw[cursor..].to_vec();
+        self.scanned = self.partial.len();
         Bytes::from(out)
     }
 
-    /// Whether payload is waiting for more input before it is emitted.
+    /// Whether text is waiting for more input before it is emitted.
     pub fn has_pending(&self) -> bool {
-        self.fields.values().any(|s| !s.is_empty())
-            || self.tool_args.values().any(|s| !s.is_empty())
+        self.fields
+            .iter()
+            .chain(self.tool_args.values())
+            .any(|pending| pending.chars > 0)
     }
 
-    /// Emit everything buffered without waiting for more input (idle upstream).
+    /// Emits all buffered text without waiting for more input.
     pub fn flush_pending(&mut self) -> Bytes {
         let mut out = Vec::new();
-        self.flush_payload(&mut out);
+        self.flush(&mut out);
         Bytes::from(out)
     }
 
-    /// Flush everything buffered (stream end).
+    /// Emits all buffered text, then whatever is left of an unfinished frame.
     pub fn finish(&mut self) -> Bytes {
         let mut out = Vec::new();
-        self.flush_payload(&mut out);
-        if !self.raw.is_empty() {
-            out.extend_from_slice(&self.raw);
-            self.raw.clear();
-        }
-        if self.unknown_events > 0 {
+        self.flush(&mut out);
+        out.append(&mut self.partial);
+        self.scanned = 0;
+        if self.forwarded_unknown > 0 {
             tracing::debug!(
-                events = self.unknown_events,
-                "SSE re-chunking forwarded events with delta or choice keys it does not merge"
+                events = self.forwarded_unknown,
+                "SSE events forwarded whole: they carried fields this module does not merge"
             );
         }
         Bytes::from(out)
     }
 
-    fn handle_frame(&mut self, frame: &[u8], out: &mut Vec<u8>) {
-        let mut data: Option<&[u8]> = None;
-        let mut data_lines = 0usize;
-        let mut other_lines = false;
-        for line in frame.split(|b| *b == b'\n' || *b == b'\r') {
-            if line.is_empty() {
-                continue;
-            }
-            match line.strip_prefix(b"data:") {
-                Some(rest) => {
-                    data_lines += 1;
-                    data = Some(rest.strip_prefix(b" ").unwrap_or(rest));
-                }
-                None => other_lines = true,
+    /// Handles every complete frame in `input` and returns the unterminated
+    /// rest. `searched` bytes at the start are known to hold no delimiter.
+    fn consume<'a>(&mut self, input: &'a [u8], searched: usize, out: &mut Vec<u8>) -> &'a [u8] {
+        let mut start = 0;
+        // A delimiter is up to four bytes long and may straddle the boundary.
+        let mut from = searched.saturating_sub(3);
+        while let Some((end, delimiter)) = find_frame_end(&input[start..], from) {
+            let frame_end = start + end + delimiter;
+            self.handle_frame(&input[start..frame_end], out);
+            start = frame_end;
+            from = 0;
+            if self.passthrough {
+                out.extend_from_slice(&input[start..]);
+                return &[];
             }
         }
-        let Some(data) = data.filter(|_| data_lines == 1 && !other_lines) else {
-            if data_lines == 0 {
-                // Comments and keep-alive frames carry no payload: forward, no flush.
+        &input[start..]
+    }
+
+    fn handle_frame(&mut self, frame: &[u8], out: &mut Vec<u8>) {
+        let data = match classify_frame(frame) {
+            Frame::Data(data) => data,
+            Frame::Comment => {
                 out.extend_from_slice(frame);
-            } else {
-                // Named events or multi-line data stay in order.
-                self.flush_payload(out);
-                out.extend_from_slice(frame);
+                return;
             }
-            return;
+            Frame::Other => {
+                self.forward(frame, out);
+                return;
+            }
         };
         if data.starts_with(b"[DONE]") {
-            self.flush_payload(out);
-            out.extend_from_slice(frame);
+            self.forward(frame, out);
             self.passthrough = true;
             return;
         }
-        let Ok(Value::Object(mut event)) = serde_json::from_slice::<Value>(data) else {
-            self.flush_payload(out);
-            out.extend_from_slice(frame);
-            return;
-        };
-        if !is_single_choice(&event) {
-            // The buffers are per stream, not per choice.
-            self.flush_payload(out);
-            out.extend_from_slice(frame);
+        let event = std::str::from_utf8(data)
+            .ok()
+            .and_then(|text| serde_json::from_str::<RawObject>(text).ok());
+        match event {
+            Some(event) => self.handle_event(&event, frame, out),
+            None => self.forward(frame, out),
+        }
+    }
+
+    /// Writes the buffered text, then the frame as it came.
+    fn forward(&mut self, frame: &[u8], out: &mut Vec<u8>) {
+        self.flush(out);
+        out.extend_from_slice(frame);
+    }
+
+    fn handle_event(&mut self, event: &RawObject<'_>, frame: &[u8], out: &mut Vec<u8>) {
+        let choices = event
+            .get("choices")
+            .and_then(parse_array)
+            .unwrap_or_default();
+        let choice = choices.first().and_then(|raw| parse_object(raw));
+        let other_choice = choice
+            .as_ref()
+            .and_then(|choice| choice.get("index"))
+            .and_then(parse_u64)
+            .is_some_and(|index| index != 0);
+        if choices.len() > 1 || other_choice {
+            self.forward(frame, out);
             self.passthrough = true;
             return;
         }
-        if has_choice_metadata(&event) {
-            // logprobs and choice-level usage describe this event's own
-            // payload, so the event is forwarded whole rather than absorbed.
-            self.flush_payload(out);
-            if first_choice(&event)
-                .and_then(|c| c.get("delta"))
-                .and_then(Value::as_object)
-                .is_some_and(|d| d.get("role").is_some_and(|r| !r.is_null()))
+
+        let delta = choice
+            .as_ref()
+            .and_then(|choice| choice.get("delta"))
+            .and_then(parse_object);
+        if choice.as_ref().is_some_and(has_choice_metadata) {
+            // logprobs and choice-level usage describe this event's own text,
+            // so the event stays whole.
+            if delta
+                .as_ref()
+                .and_then(|delta| delta.get("role"))
+                .is_some_and(|role| !is_null(role))
             {
                 self.role_sent = true;
             }
-            out.extend_from_slice(frame);
-            self.unknown_events += 1;
+            self.forward(frame, out);
+            self.forwarded_unknown += 1;
             return;
         }
 
-        let Absorbed {
-            opens,
-            closes,
-            payload,
-        } = self.absorb(&mut event);
-        if event
-            .get("choices")
-            .and_then(Value::as_array)
-            .is_some_and(|c| c.len() == 1)
-        {
-            let mut envelope = event.clone();
-            envelope.remove("choices");
-            envelope.remove("usage");
-            self.envelope = envelope;
+        let mut shape = Shape {
+            closes: choice.is_none()
+                || delta.is_none()
+                || event.get("usage").is_some_and(|usage| !is_null(usage))
+                || choice
+                    .as_ref()
+                    .and_then(|choice| choice.get("finish_reason"))
+                    .is_some_and(|finish| !is_null(finish)),
+            ..Shape::default()
+        };
+        if let Some(delta) = &delta {
+            self.inspect_delta(delta, &mut shape);
+        }
+        if choices.len() == 1 {
+            self.update_envelope(event);
         }
 
-        // Earlier payload must precede an opening event; a closing-only event
-        // flushes together with its own payload below, so nothing is split.
-        if opens {
-            self.flush_payload(out);
-        }
-        match (opens, closes) {
+        let structural = Structural {
+            event,
+            choice: choice.as_ref(),
+            delta: delta.as_ref(),
+            shape: &shape,
+        };
+        // Text already buffered goes out before an event that opens
+        // something; an event that closes something goes out after its own
+        // text, so nothing is split.
+        match (shape.opens, shape.closes) {
             (true, true) => {
-                let (opening, closing) = split_open_close(event);
-                write_event(&Value::Object(opening), out);
-                self.push_payload(payload, out);
-                self.flush_payload(out);
-                write_event(&Value::Object(closing), out);
+                self.flush(out);
+                write_event(&structural, Variant::Opening, out);
+                self.push_text(&shape, out);
+                self.flush(out);
+                write_event(&structural, Variant::Closing, out);
             }
             (true, false) => {
-                write_event(&Value::Object(event), out);
-                self.push_payload(payload, out);
+                self.flush(out);
+                write_event(&structural, Variant::Whole, out);
+                self.push_text(&shape, out);
                 self.drain_ready(out);
             }
             (false, true) => {
-                self.push_payload(payload, out);
-                self.flush_payload(out);
-                write_event(&Value::Object(event), out);
+                self.push_text(&shape, out);
+                self.flush(out);
+                write_event(&structural, Variant::Whole, out);
             }
             (false, false) => {
-                self.push_payload(payload, out);
+                self.push_text(&shape, out);
                 self.drain_ready(out);
             }
         }
     }
 
-    /// Pull payload strings out of the event's delta, leaving the parts that
-    /// must be forwarded in order.
-    fn absorb(&mut self, event: &mut Map<String, Value>) -> Absorbed {
-        let mut absorbed = Absorbed {
-            opens: false,
-            closes: event.get("usage").is_some_and(|u| !u.is_null()),
-            payload: Vec::new(),
-        };
-        let Some(Value::Array(choices)) = event.get_mut("choices") else {
-            absorbed.closes = true;
-            return absorbed;
-        };
-        let Some(Value::Object(choice)) = choices.first_mut() else {
-            absorbed.closes = true;
-            return absorbed;
-        };
-        if choice.get("finish_reason").is_some_and(|f| !f.is_null()) {
-            absorbed.closes = true;
-        }
-        let Some(Value::Object(delta)) = choice.get_mut("delta") else {
-            // Not a chat chunk (legacy completions `text`, vendor shapes).
-            absorbed.closes = true;
-            return absorbed;
-        };
-
-        for field in PAYLOAD_FIELDS {
-            match delta.get(field) {
-                Some(Value::String(s)) => {
-                    if !s.is_empty() {
-                        absorbed.payload.push((Buffer::Field(field), s.clone()));
-                    }
-                    delta.remove(field);
+    /// Sorts the delta's fields into buffered text and the parts that must
+    /// be forwarded in order.
+    fn inspect_delta<'a>(&mut self, delta: &RawObject<'a>, shape: &mut Shape<'a>) {
+        let mut unknown = false;
+        for (key, value) in &delta.entries {
+            if is_null(value) {
+                continue;
+            }
+            match key.as_ref() {
+                "role" if self.role_sent => {}
+                "role" => {
+                    self.role_sent = true;
+                    shape.first_role = true;
+                    shape.opens = true;
                 }
-                Some(Value::Null) => {
-                    delta.remove(field);
-                }
-                _ => {}
+                "tool_calls" => unknown |= !inspect_tool_calls(value, shape),
+                key => match PAYLOAD_FIELDS.iter().position(|field| *field == key) {
+                    Some(slot) => match parse_text(value) {
+                        Some(text) if text.is_empty() => {}
+                        Some(text) => shape.texts[slot] = Some(text),
+                        None => unknown = true,
+                    },
+                    None => unknown = true,
+                },
             }
         }
-        if let Some(Value::Array(tool_calls)) = delta.get_mut("tool_calls") {
-            let mut identity = false;
-            for tc in tool_calls.iter_mut() {
-                let Some(tc_obj) = tc.as_object_mut() else {
-                    absorbed.closes = true;
-                    continue;
-                };
-                tc_obj.retain(|_, v| !v.is_null());
-                let index = tc_obj.get("index").and_then(Value::as_u64);
-                if let Some(Value::Object(function)) = tc_obj.get_mut("function") {
-                    function.retain(|_, v| !v.is_null());
-                    if let Some(Value::String(args)) = function.get("arguments") {
-                        if !args.is_empty() {
-                            absorbed
-                                .payload
-                                .push((Buffer::ToolArgs(index), args.clone()));
-                        }
-                        function.remove("arguments");
-                    }
-                    if function.contains_key("name") {
-                        identity = true;
-                    }
-                }
-                if tc_obj.contains_key("id") {
-                    identity = true;
-                }
-            }
-            if identity {
-                absorbed.opens = true;
-            } else if tool_calls.iter().all(is_tool_call_shell) {
-                delta.remove("tool_calls");
-            } else {
-                // A tool-call entry with something this module does not merge.
-                absorbed.closes = true;
-                self.unknown_events += 1;
-            }
+        if unknown {
+            shape.closes = true;
+            self.forwarded_unknown += 1;
         }
-        if delta.contains_key("role") {
-            if self.role_sent {
-                delta.remove("role");
-            } else {
-                self.role_sent = true;
-                absorbed.opens = true;
-            }
-        }
-        delta.retain(|_, v| !v.is_null());
-        if delta.keys().any(|k| k != "role" && k != "tool_calls") {
-            absorbed.closes = true;
-            self.unknown_events += 1;
-        }
-        absorbed
     }
 
-    fn push_payload(&mut self, payload: Vec<(Buffer, String)>, out: &mut Vec<u8>) {
-        for (buffer, text) in payload {
-            if self.last.is_some_and(|last| last != buffer) {
-                // A field switch (reasoning to content, one call to the next)
-                // keeps stream order.
-                self.flush_payload(out);
+    /// Keeps the envelope in step with the latest event.
+    fn update_envelope(&mut self, event: &RawObject<'_>) {
+        self.scratch.clear();
+        self.scratch.push(b'{');
+        for (key, value) in &event.entries {
+            if key == "choices" || key == "usage" {
+                continue;
             }
-            self.last = Some(buffer);
-            match buffer {
-                Buffer::Field(field) => self.fields.entry(field).or_default().push_str(&text),
-                Buffer::ToolArgs(index) => self.tool_args.entry(index).or_default().push_str(&text),
+            write_json(&mut self.scratch, key.as_ref());
+            self.scratch.push(b':');
+            self.scratch.extend_from_slice(value.get().as_bytes());
+            self.scratch.push(b',');
+        }
+        if self.scratch != self.envelope {
+            std::mem::swap(&mut self.scratch, &mut self.envelope);
+        }
+    }
+
+    fn push_text(&mut self, shape: &Shape<'_>, out: &mut Vec<u8>) {
+        for (slot, text) in shape.texts.iter().enumerate() {
+            if let Some(text) = text {
+                self.push(Slot::Field(slot), text, out);
+            }
+        }
+        for call in &shape.tool_calls {
+            if let Some(arguments) = &call.arguments {
+                self.push(Slot::ToolArgs(call.index), arguments, out);
             }
         }
     }
 
-    /// Emit while enough payload is buffered.
+    fn push(&mut self, slot: Slot, text: &str, out: &mut Vec<u8>) {
+        if self.last.is_some_and(|last| last != slot) {
+            self.flush(out);
+        }
+        self.last = Some(slot);
+        let pending = match slot {
+            Slot::Field(field) => &mut self.fields[field],
+            Slot::ToolArgs(index) => self.tool_args.entry(index).or_default(),
+        };
+        pending.text.push_str(text);
+        pending.chars += text.chars().count();
+    }
+
+    /// Emits slices while enough text is buffered.
     fn drain_ready(&mut self, out: &mut Vec<u8>) {
-        for field in PAYLOAD_FIELDS {
-            while self
-                .fields
-                .get(field)
-                .is_some_and(|s| s.chars().count() >= EMIT_THRESHOLD)
-            {
-                let slice = self
-                    .fields
-                    .get_mut(field)
-                    .map(take_slice)
-                    .unwrap_or_default();
-                self.emit_field(field, slice, out);
+        for (field, pending) in PAYLOAD_FIELDS.iter().zip(&mut self.fields) {
+            while pending.chars >= EMIT_THRESHOLD {
+                emit_text(&self.envelope, field, pending, out);
             }
         }
-        let indices: Vec<Option<u64>> = self.tool_args.keys().copied().collect();
-        for index in indices {
-            while self
-                .tool_args
-                .get(&index)
-                .is_some_and(|s| s.chars().count() >= EMIT_THRESHOLD)
-            {
-                let slice = self
-                    .tool_args
-                    .get_mut(&index)
-                    .map(take_slice)
-                    .unwrap_or_default();
-                self.emit_tool_args(index, slice, out);
+        for (index, pending) in &mut self.tool_args {
+            while pending.chars >= EMIT_THRESHOLD {
+                emit_arguments(&self.envelope, *index, pending, out);
             }
         }
     }
 
-    /// Emit every remaining buffered slice.
-    fn flush_payload(&mut self, out: &mut Vec<u8>) {
-        for field in PAYLOAD_FIELDS {
-            while self.fields.get(field).is_some_and(|s| !s.is_empty()) {
-                let slice = self
-                    .fields
-                    .get_mut(field)
-                    .map(take_slice)
-                    .unwrap_or_default();
-                self.emit_field(field, slice, out);
+    /// Emits every buffered slice.
+    fn flush(&mut self, out: &mut Vec<u8>) {
+        for (field, pending) in PAYLOAD_FIELDS.iter().zip(&mut self.fields) {
+            while pending.chars > 0 {
+                emit_text(&self.envelope, field, pending, out);
             }
         }
-        let indices: Vec<Option<u64>> = self.tool_args.keys().copied().collect();
-        for index in indices {
-            while self.tool_args.get(&index).is_some_and(|s| !s.is_empty()) {
-                let slice = self
-                    .tool_args
-                    .get_mut(&index)
-                    .map(take_slice)
-                    .unwrap_or_default();
-                self.emit_tool_args(index, slice, out);
+        for (index, pending) in &mut self.tool_args {
+            while pending.chars > 0 {
+                emit_arguments(&self.envelope, *index, pending, out);
             }
         }
     }
-
-    fn emit_field(&self, field: &str, slice: String, out: &mut Vec<u8>) {
-        let mut delta = Map::new();
-        delta.insert(field.to_string(), Value::String(slice));
-        self.emit_delta(delta, out);
-    }
-
-    fn emit_tool_args(&self, index: Option<u64>, slice: String, out: &mut Vec<u8>) {
-        let mut function = Map::new();
-        function.insert("arguments".into(), Value::String(slice));
-        let mut tc = Map::new();
-        if let Some(index) = index {
-            tc.insert("index".into(), Value::from(index));
-        }
-        tc.insert("function".into(), Value::Object(function));
-        let mut delta = Map::new();
-        delta.insert("tool_calls".into(), Value::Array(vec![Value::Object(tc)]));
-        self.emit_delta(delta, out);
-    }
-
-    fn emit_delta(&self, delta: Map<String, Value>, out: &mut Vec<u8>) {
-        let mut event = self.envelope.clone();
-        let mut choice = Map::new();
-        choice.insert("index".into(), Value::from(0u64));
-        choice.insert("delta".into(), Value::Object(delta));
-        choice.insert("finish_reason".into(), Value::Null);
-        event.insert("choices".into(), Value::Array(vec![Value::Object(choice)]));
-        write_event(&Value::Object(event), out);
-    }
 }
 
-/// Re-chunking keys its buffers by field, not by choice.
-fn is_single_choice(event: &Map<String, Value>) -> bool {
-    match event.get("choices").and_then(Value::as_array) {
-        Some(choices) if choices.len() > 1 => false,
-        Some(choices) => choices.first().is_none_or(|choice| {
-            choice
-                .get("index")
-                .and_then(Value::as_u64)
-                .is_none_or(|index| index == 0)
-        }),
-        None => true,
-    }
+/// What an event carries besides the text that gets buffered.
+#[derive(Default)]
+struct Shape<'a> {
+    /// Something later text attaches to (a role, a tool-call identity): it
+    /// must be written before that text.
+    opens: bool,
+    /// Something that ends earlier text (finish_reason, usage, a field this
+    /// module does not merge): it must be written after that text.
+    closes: bool,
+    /// The event carries the stream's first `role`; later roles are dropped.
+    first_role: bool,
+    /// Every tool-call entry was emptied by taking its arguments.
+    drop_tool_calls: bool,
+    /// Buffered text per `PAYLOAD_FIELDS` position.
+    texts: [Option<Text<'a>>; PAYLOAD_FIELDS.len()],
+    tool_calls: Vec<ToolCall<'a>>,
 }
 
-/// Whether the choice carries a non-null key beyond index, delta and finish_reason.
-fn has_choice_metadata(event: &Map<String, Value>) -> bool {
-    first_choice(event).is_some_and(|choice| {
-        choice.iter().any(|(key, value)| {
-            !matches!(key.as_str(), "index" | "delta" | "finish_reason") && !value.is_null()
-        })
-    })
+struct ToolCall<'a> {
+    raw: &'a RawValue,
+    /// `None` when the entry is not an object; it is then forwarded as is.
+    object: Option<RawObject<'a>>,
+    function: Option<RawObject<'a>>,
+    index: Option<u64>,
+    arguments: Option<Text<'a>>,
 }
 
-fn first_choice(event: &Map<String, Value>) -> Option<&Map<String, Value>> {
-    event
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(Value::as_object)
-}
-
-/// A tool-call entry left with nothing but its index, type, or an emptied function.
-fn is_tool_call_shell(tc: &Value) -> bool {
-    tc.as_object().is_some_and(|o| {
-        o.iter().all(|(k, v)| {
-            k == "index"
-                || k == "type"
-                || (k == "function" && v.as_object().is_some_and(Map::is_empty))
-        })
-    })
-}
-
-/// Split an event that both opens (role, identity) and closes (finish, usage)
-/// into the opening part and a closing part with an empty delta.
-fn split_open_close(mut event: Map<String, Value>) -> (Map<String, Value>, Map<String, Value>) {
-    let mut opening = event.clone();
-    opening.remove("usage");
-    if let Some(choice) = first_choice_mut(&mut opening) {
-        choice.insert("finish_reason".into(), Value::Null);
-    }
-    if let Some(choice) = first_choice_mut(&mut event) {
-        choice.insert("delta".into(), Value::Object(Map::new()));
-    }
-    (opening, event)
-}
-
-fn first_choice_mut(event: &mut Map<String, Value>) -> Option<&mut Map<String, Value>> {
-    event
-        .get_mut("choices")
-        .and_then(Value::as_array_mut)
-        .and_then(|choices| choices.first_mut())
-        .and_then(Value::as_object_mut)
-}
-
-fn write_event(event: &Value, out: &mut Vec<u8>) {
-    out.extend_from_slice(b"data: ");
-    #[expect(clippy::expect_used, reason = "serializing a Value cannot fail")]
-    out.extend_from_slice(
-        serde_json::to_string(event)
-            .expect("serialize SSE event")
-            .as_bytes(),
-    );
-    out.extend_from_slice(b"\n\n");
-}
-
-/// Split off the next slice: at most `SLICE_CHARS`, never leaving a tail
-/// shorter than `MIN_TAIL_CHARS`.
-fn take_slice(buf: &mut String) -> String {
-    let total = buf.chars().count();
-    let take = if total <= SLICE_CHARS {
-        total
-    } else if total - SLICE_CHARS < MIN_TAIL_CHARS {
-        total - MIN_TAIL_CHARS
-    } else {
-        SLICE_CHARS
+/// Records the tool-call entries of a delta in `shape`. Returns false when
+/// the array holds something this module does not merge.
+fn inspect_tool_calls<'a>(value: &'a RawValue, shape: &mut Shape<'a>) -> bool {
+    let Some(entries) = parse_array(value) else {
+        shape.closes = true;
+        return false;
     };
-    take_chars(buf, take)
+    let mut identity = false;
+    let mut merged = true;
+    for raw in entries {
+        let object = parse_object(raw);
+        let function = object
+            .as_ref()
+            .and_then(|object| object.get("function"))
+            .and_then(parse_object);
+        let arguments = function
+            .as_ref()
+            .and_then(|function| function.get("arguments"))
+            .filter(|arguments| !is_null(arguments))
+            .and_then(parse_text)
+            .filter(|arguments| !arguments.is_empty());
+        identity |= function
+            .as_ref()
+            .and_then(|function| function.get("name"))
+            .is_some_and(|name| !is_null(name));
+        identity |= object
+            .as_ref()
+            .and_then(|object| object.get("id"))
+            .is_some_and(|id| !is_null(id));
+        merged &= object.is_some();
+        shape.tool_calls.push(ToolCall {
+            raw,
+            index: object
+                .as_ref()
+                .and_then(|object| object.get("index"))
+                .and_then(parse_u64),
+            object,
+            function,
+            arguments,
+        });
+    }
+    if identity {
+        shape.opens = true;
+    } else if merged && shape.tool_calls.iter().all(is_shell) {
+        shape.drop_tool_calls = true;
+    } else {
+        shape.closes = true;
+        return false;
+    }
+    true
 }
 
-/// Split off up to `max_chars` characters from the front of `buf`.
-fn take_chars(buf: &mut String, max_chars: usize) -> String {
-    match buf.char_indices().nth(max_chars) {
-        Some((byte_idx, _)) => {
-            let rest = buf.split_off(byte_idx);
-            std::mem::replace(buf, rest)
+/// A tool-call entry left with nothing but its index, type, or an emptied
+/// function once its arguments were taken.
+fn is_shell(call: &ToolCall<'_>) -> bool {
+    call.object.as_ref().is_some_and(|object| {
+        object.entries.iter().all(|(key, value)| {
+            is_null(value)
+                || key == "index"
+                || key == "type"
+                || (key == "function"
+                    && call.function.as_ref().is_some_and(|function| {
+                        function
+                            .entries
+                            .iter()
+                            .all(|(key, value)| is_null(value) || key == "arguments")
+                    }))
+        })
+    })
+}
+
+/// Whether the choice carries a non-null field beyond index, delta and
+/// finish_reason.
+fn has_choice_metadata(choice: &RawObject<'_>) -> bool {
+    choice.entries.iter().any(|(key, value)| {
+        !matches!(key.as_ref(), "index" | "delta" | "finish_reason") && !is_null(value)
+    })
+}
+
+/// The parts of an event that are written back after its text was taken.
+struct Structural<'s, 'a> {
+    event: &'s RawObject<'a>,
+    choice: Option<&'s RawObject<'a>>,
+    delta: Option<&'s RawObject<'a>>,
+    shape: &'s Shape<'a>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Variant {
+    Whole,
+    /// The event minus what ends the stream: `finish_reason` becomes null
+    /// and `usage` is left out.
+    Opening,
+    /// The event with an empty delta.
+    Closing,
+}
+
+fn write_event(structural: &Structural<'_, '_>, variant: Variant, out: &mut Vec<u8>) {
+    out.extend_from_slice(b"data: {");
+    let mut comma = Comma::default();
+    for (key, value) in &structural.event.entries {
+        match (key.as_ref(), structural.choice) {
+            ("choices", Some(choice)) => {
+                comma.key(out, key);
+                out.push(b'[');
+                write_choice(choice, structural, variant, out);
+                out.push(b']');
+            }
+            ("usage", _) if variant == Variant::Opening => {}
+            _ => comma.raw(out, key, value),
         }
-        None => std::mem::take(buf),
+    }
+    out.extend_from_slice(b"}\n\n");
+}
+
+fn write_choice(
+    choice: &RawObject<'_>,
+    structural: &Structural<'_, '_>,
+    variant: Variant,
+    out: &mut Vec<u8>,
+) {
+    out.push(b'{');
+    let mut comma = Comma::default();
+    for (key, value) in &choice.entries {
+        match (key.as_ref(), structural.delta) {
+            ("delta", _) if variant == Variant::Closing => {
+                comma.key(out, key);
+                out.extend_from_slice(b"{}");
+            }
+            ("delta", Some(delta)) => {
+                comma.key(out, key);
+                write_delta(delta, structural.shape, out);
+            }
+            ("finish_reason", _) if variant == Variant::Opening => {
+                comma.key(out, key);
+                out.extend_from_slice(b"null");
+            }
+            _ => comma.raw(out, key, value),
+        }
+    }
+    out.push(b'}');
+}
+
+/// The delta without the text that was buffered, null fields, repeated
+/// roles and emptied tool-call entries.
+fn write_delta(delta: &RawObject<'_>, shape: &Shape<'_>, out: &mut Vec<u8>) {
+    out.push(b'{');
+    let mut comma = Comma::default();
+    for (key, value) in &delta.entries {
+        if is_null(value) {
+            continue;
+        }
+        match key.as_ref() {
+            "role" if !shape.first_role => {}
+            "tool_calls" if shape.drop_tool_calls => {}
+            "tool_calls" if !shape.tool_calls.is_empty() => {
+                comma.key(out, key);
+                write_tool_calls(&shape.tool_calls, out);
+            }
+            key if PAYLOAD_FIELDS.contains(&key) && value.get().starts_with('"') => {}
+            _ => comma.raw(out, key, value),
+        }
+    }
+    out.push(b'}');
+}
+
+fn write_tool_calls(calls: &[ToolCall<'_>], out: &mut Vec<u8>) {
+    out.push(b'[');
+    for (position, call) in calls.iter().enumerate() {
+        if position > 0 {
+            out.push(b',');
+        }
+        let Some(object) = &call.object else {
+            out.extend_from_slice(call.raw.get().as_bytes());
+            continue;
+        };
+        out.push(b'{');
+        let mut comma = Comma::default();
+        for (key, value) in &object.entries {
+            if is_null(value) {
+                continue;
+            }
+            match (key.as_ref(), &call.function) {
+                ("function", Some(function)) => {
+                    comma.key(out, key);
+                    write_function(function, out);
+                }
+                _ => comma.raw(out, key, value),
+            }
+        }
+        out.push(b'}');
+    }
+    out.push(b']');
+}
+
+fn write_function(function: &RawObject<'_>, out: &mut Vec<u8>) {
+    out.push(b'{');
+    let mut comma = Comma::default();
+    for (key, value) in &function.entries {
+        let taken = key == "arguments" && value.get().starts_with('"');
+        if !is_null(value) && !taken {
+            comma.raw(out, key, value);
+        }
+    }
+    out.push(b'}');
+}
+
+/// Writes one synthesized event with the next slice of `pending` as `field`.
+fn emit_text(envelope: &[u8], field: &str, pending: &mut Pending, out: &mut Vec<u8>) {
+    let (bytes, chars) = pending.next_slice();
+    out.extend_from_slice(b"data: ");
+    out.extend_from_slice(envelope);
+    out.extend_from_slice(b"\"choices\":[{\"index\":0,\"delta\":{");
+    write_json(out, field);
+    out.push(b':');
+    write_json(out, &pending.text[..bytes]);
+    out.extend_from_slice(b"},\"finish_reason\":null}]}\n\n");
+    pending.cut(bytes, chars);
+}
+
+/// Writes one synthesized event with the next slice of `pending` as the
+/// arguments of tool call `index`.
+fn emit_arguments(envelope: &[u8], index: Option<u64>, pending: &mut Pending, out: &mut Vec<u8>) {
+    let (bytes, chars) = pending.next_slice();
+    out.extend_from_slice(b"data: ");
+    out.extend_from_slice(envelope);
+    out.extend_from_slice(b"\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{");
+    if let Some(index) = index {
+        out.extend_from_slice(b"\"index\":");
+        write_json(out, &index);
+        out.push(b',');
+    }
+    out.extend_from_slice(b"\"function\":{\"arguments\":");
+    write_json(out, &pending.text[..bytes]);
+    out.extend_from_slice(b"}}]},\"finish_reason\":null}]}\n\n");
+    pending.cut(bytes, chars);
+}
+
+impl Pending {
+    /// Byte and character length of the next slice: at most `SLICE_CHARS`,
+    /// never leaving a tail shorter than `MIN_TAIL_CHARS`.
+    fn next_slice(&self) -> (usize, usize) {
+        let chars = if self.chars <= SLICE_CHARS {
+            self.chars
+        } else if self.chars - SLICE_CHARS < MIN_TAIL_CHARS {
+            self.chars - MIN_TAIL_CHARS
+        } else {
+            SLICE_CHARS
+        };
+        let bytes = self
+            .text
+            .char_indices()
+            .nth(chars)
+            .map_or(self.text.len(), |(byte, _)| byte);
+        (bytes, chars)
+    }
+
+    fn cut(&mut self, bytes: usize, chars: usize) {
+        self.text.drain(..bytes);
+        self.chars -= chars;
+    }
+}
+
+/// Puts the commas between the members of a JSON object being written.
+#[derive(Default)]
+struct Comma {
+    started: bool,
+}
+
+impl Comma {
+    fn key(&mut self, out: &mut Vec<u8>, key: &str) {
+        if self.started {
+            out.push(b',');
+        }
+        self.started = true;
+        write_json(out, key);
+        out.push(b':');
+    }
+
+    fn raw(&mut self, out: &mut Vec<u8>, key: &str, value: &RawValue) {
+        self.key(out, key);
+        out.extend_from_slice(value.get().as_bytes());
+    }
+}
+
+#[expect(clippy::expect_used, reason = "serializing into a Vec cannot fail")]
+fn write_json<T: Serialize + ?Sized>(out: &mut Vec<u8>, value: &T) {
+    serde_json::to_writer(&mut *out, value).expect("serialize JSON into a Vec");
+}
+
+/// A JSON object as its keys and untouched values, in order.
+struct RawObject<'a> {
+    entries: Vec<(Cow<'a, str>, &'a RawValue)>,
+}
+
+impl<'a> RawObject<'a> {
+    fn get(&self, key: &str) -> Option<&'a RawValue> {
+        self.entries
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| *value)
+    }
+}
+
+impl<'de> Deserialize<'de> for RawObject<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ObjectVisitor;
+
+        impl<'de> Visitor<'de> for ObjectVisitor {
+            type Value = RawObject<'de>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((key, value)) = map.next_entry::<Text<'de>, &'de RawValue>()? {
+                    entries.push((key.0, value));
+                }
+                Ok(RawObject { entries })
+            }
+        }
+
+        deserializer.deserialize_map(ObjectVisitor)
+    }
+}
+
+/// A JSON string, borrowed from the input unless it contains escapes.
+struct Text<'a>(Cow<'a, str>);
+
+impl std::ops::Deref for Text<'_> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Text<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct TextVisitor;
+
+        impl<'de> Visitor<'de> for TextVisitor {
+            type Value = Text<'de>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a string")
+            }
+
+            fn visit_borrowed_str<E: de::Error>(self, text: &'de str) -> Result<Self::Value, E> {
+                Ok(Text(Cow::Borrowed(text)))
+            }
+
+            fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                Ok(Text(Cow::Owned(text.to_owned())))
+            }
+
+            fn visit_string<E: de::Error>(self, text: String) -> Result<Self::Value, E> {
+                Ok(Text(Cow::Owned(text)))
+            }
+        }
+
+        deserializer.deserialize_str(TextVisitor)
+    }
+}
+
+fn parse_object(raw: &RawValue) -> Option<RawObject<'_>> {
+    serde_json::from_str(raw.get()).ok()
+}
+
+fn parse_array(raw: &RawValue) -> Option<Vec<&RawValue>> {
+    serde_json::from_str(raw.get()).ok()
+}
+
+fn parse_text(raw: &RawValue) -> Option<Text<'_>> {
+    raw.get()
+        .starts_with('"')
+        .then(|| serde_json::from_str(raw.get()).ok())
+        .flatten()
+}
+
+fn parse_u64(raw: &RawValue) -> Option<u64> {
+    raw.get().parse().ok()
+}
+
+fn is_null(raw: &RawValue) -> bool {
+    raw.get() == "null"
+}
+
+enum Frame<'a> {
+    /// A frame made of exactly one `data:` line.
+    Data(&'a [u8]),
+    /// A comment or keep-alive: no `data:` line at all.
+    Comment,
+    Other,
+}
+
+fn classify_frame(frame: &[u8]) -> Frame<'_> {
+    let mut data = None;
+    let mut data_lines = 0;
+    let mut other_lines = false;
+    for line in frame.split(|byte| *byte == b'\n' || *byte == b'\r') {
+        if line.is_empty() {
+            continue;
+        }
+        match line.strip_prefix(b"data:") {
+            Some(rest) => {
+                data_lines += 1;
+                data = Some(rest.strip_prefix(b" ").unwrap_or(rest));
+            }
+            None => other_lines = true,
+        }
+    }
+    match (data, data_lines, other_lines) {
+        (Some(data), 1, false) => Frame::Data(data),
+        (_, 0, _) => Frame::Comment,
+        _ => Frame::Other,
     }
 }
 
 /// Position and length of the first frame delimiter at or after `from`:
 /// `\r\n\r\n`, `\n\n` or `\r\r`.
-fn find_frame_end(raw: &[u8], from: usize) -> Option<(usize, usize)> {
-    (from..raw.len()).find_map(|i| {
-        if raw[i..].starts_with(b"\r\n\r\n") {
+fn find_frame_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+    (from..buf.len()).find_map(|i| {
+        if buf[i..].starts_with(b"\r\n\r\n") {
             Some((i, 4))
-        } else if raw[i..].starts_with(b"\n\n") || raw[i..].starts_with(b"\r\r") {
+        } else if buf[i..].starts_with(b"\n\n") || buf[i..].starts_with(b"\r\r") {
             Some((i, 2))
         } else {
             None
@@ -569,13 +856,10 @@ fn find_frame_end(raw: &[u8], from: usize) -> Option<(usize, usize)> {
     })
 }
 
-/// Re-chunk a stream of SSE body chunks: every chunk passes through an
-/// [`SseRechunker`], payload held back is flushed once the upstream has been
-/// silent for [`IDLE_FLUSH`], and the tail is flushed when the stream ends. An
-/// upstream error still follows whatever payload was pending.
-///
-/// The HTTP relay drives the re-chunker inline with its forwarding loop; this
-/// adapter serves streams the gateway encodes itself (the gRPC pipeline).
+/// Re-chunks a stream of SSE body chunks: every chunk passes through an
+/// [`SseRechunker`], text held back is flushed once the upstream has been
+/// quiet for [`IDLE_FLUSH`], and the tail is flushed when the stream ends.
+/// An upstream error still follows whatever text was pending.
 pub(crate) fn rechunk_stream<S, E>(inner: S) -> impl Stream<Item = Result<Bytes, E>> + Send
 where
     S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
@@ -584,7 +868,6 @@ where
     struct State<S, E> {
         inner: S,
         rechunker: SseRechunker,
-        /// One timer, reset per chunk, instead of a fresh sleep per token.
         idle: Pin<Box<tokio::time::Sleep>>,
         /// An upstream error, delivered after the flushed tail.
         deferred: Option<E>,
@@ -610,7 +893,7 @@ where
                 chunk = st.inner.next() => match chunk {
                     Some(Ok(bytes)) => {
                         st.idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
-                        let out = st.rechunker.feed(&bytes);
+                        let out = st.rechunker.feed(bytes);
                         if !out.is_empty() {
                             return Some((Ok(out), st));
                         }
@@ -650,10 +933,15 @@ mod tests {
     use std::io;
 
     use futures::stream;
+    use serde_json::Value;
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
 
     use super::*;
+
+    fn bytes(data: impl AsRef<[u8]>) -> Bytes {
+        Bytes::copy_from_slice(data.as_ref())
+    }
 
     fn events(bytes: &[u8]) -> Vec<Value> {
         String::from_utf8_lossy(bytes)
@@ -676,7 +964,7 @@ mod tests {
         let mut r = SseRechunker::new();
         let mut all = Vec::new();
         for frame in frames {
-            all.extend_from_slice(r.feed(frame.as_bytes()).as_ref());
+            all.extend_from_slice(r.feed(bytes(frame)).as_ref());
         }
         all.extend_from_slice(r.finish().as_ref());
         all
@@ -727,15 +1015,26 @@ mod tests {
     }
 
     #[test]
+    fn escaped_text_is_rebuilt_exactly() {
+        let text = "line one\n\t\"quoted\" \\ 中文 \u{1F600}";
+        let evs = events(&run(&[&content_event(text)]));
+        let joined: String = evs
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(joined, text);
+    }
+
+    #[test]
     fn frames_split_across_chunks_are_reassembled() {
         let frame = content_event(&"y".repeat(100));
-        let bytes = frame.as_bytes();
+        let frame = frame.as_bytes();
         let mut r = SseRechunker::new();
         let mut all = Vec::new();
         for k in [7usize, 40, 90] {
-            all.extend_from_slice(r.feed(&bytes[..k]).as_ref());
+            all.extend_from_slice(r.feed(bytes(&frame[..k])).as_ref());
             assert!(all.is_empty(), "nothing before the frame is complete");
-            all.extend_from_slice(r.feed(&bytes[k..]).as_ref());
+            all.extend_from_slice(r.feed(bytes(&frame[k..])).as_ref());
             all.extend_from_slice(r.finish().as_ref());
             let sizes = content_sizes(&events(&all));
             assert_eq!(sizes, vec![100], "split at {k}");
@@ -766,30 +1065,39 @@ mod tests {
     #[test]
     fn a_delimiter_split_across_feeds_is_found() {
         let frame = content_event(&"z".repeat(100));
-        let bytes = frame.as_bytes();
+        let frame = frame.as_bytes();
         let mut r = SseRechunker::new();
         let mut all = Vec::new();
-        all.extend_from_slice(r.feed(&bytes[..bytes.len() - 1]).as_ref());
+        all.extend_from_slice(r.feed(bytes(&frame[..frame.len() - 1])).as_ref());
         assert!(all.is_empty());
-        all.extend_from_slice(r.feed(&bytes[bytes.len() - 1..]).as_ref());
+        all.extend_from_slice(r.feed(bytes(&frame[frame.len() - 1..])).as_ref());
         assert_eq!(content_sizes(&events(&all)), vec![100]);
     }
 
     #[test]
     fn oversized_unterminated_frames_switch_to_passthrough() {
         let mut r = SseRechunker::new();
-        assert!(r.feed(content_event("ab").as_bytes()).is_empty());
+        assert!(r.feed(bytes(content_event("ab"))).is_empty());
         let fragment = vec![b'q'; 64 * 1024];
         let mut forwarded = Vec::new();
         for _ in 0..17 {
-            forwarded.extend_from_slice(r.feed(&fragment).as_ref());
+            forwarded.extend_from_slice(r.feed(bytes(&fragment)).as_ref());
         }
         // The pending payload came out first, then every raw byte.
         let text = String::from_utf8_lossy(&forwarded);
         assert!(text.starts_with("data: "), "pending payload flushed first");
         assert!(text.ends_with(&"q".repeat(64 * 1024)));
         assert_eq!(text.matches('q').count(), 17 * 64 * 1024);
-        assert_eq!(r.feed(b"more").as_ref(), b"more");
+        assert_eq!(r.feed(bytes(b"more")).as_ref(), b"more");
+    }
+
+    #[test]
+    fn passthrough_returns_the_chunk_it_was_given() {
+        let mut r = SseRechunker::new();
+        r.feed(bytes(b"data: [DONE]\n\n"));
+        let chunk = Bytes::from_static(b"trailing bytes");
+        let returned = r.feed(chunk.clone());
+        assert_eq!(returned.as_ptr(), chunk.as_ptr(), "no copy in passthrough");
     }
 
     #[test]
@@ -902,6 +1210,21 @@ mod tests {
     }
 
     #[test]
+    fn repeated_roles_do_not_break_merging() {
+        let frame = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ab\"},\"logprobs\":null,\"finish_reason\":null}]}\n\n";
+        let frames = [frame; 50];
+        let evs = events(&run(&frames));
+        let roles = evs
+            .iter()
+            .filter(|e| e["choices"][0]["delta"]["role"].is_string())
+            .count();
+        assert_eq!(roles, 1, "only the first role is forwarded");
+        let sizes = content_sizes(&evs);
+        assert!(sizes.iter().all(|&s| s >= 5), "sizes: {sizes:?}");
+        assert_eq!(sizes.iter().sum::<usize>(), 100);
+    }
+
+    #[test]
     fn tool_call_identity_precedes_arguments() {
         let start = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"\"}}]}}]}\n\n";
         let args = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"k\\\":1}\"}}]}}]}\n\n";
@@ -1008,8 +1331,8 @@ mod tests {
         let two = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}},{\"index\":1,\"delta\":{\"content\":\"b\"}}]}\n\n";
         let mut r = SseRechunker::new();
         let mut all = Vec::new();
-        all.extend_from_slice(r.feed(two.as_bytes()).as_ref());
-        all.extend_from_slice(r.feed(two.as_bytes()).as_ref());
+        all.extend_from_slice(r.feed(bytes(two)).as_ref());
+        all.extend_from_slice(r.feed(bytes(two)).as_ref());
         all.extend_from_slice(r.finish().as_ref());
         assert_eq!(all, [two.as_bytes(), two.as_bytes()].concat());
     }
@@ -1065,7 +1388,7 @@ mod tests {
     #[test]
     fn flush_pending_emits_what_is_buffered() {
         let mut r = SseRechunker::new();
-        assert!(r.feed(content_event("hi").as_bytes()).is_empty());
+        assert!(r.feed(bytes(content_event("hi"))).is_empty());
         assert!(r.has_pending());
         let evs = events(&r.flush_pending());
         assert_eq!(evs[0]["choices"][0]["delta"]["content"], Value::from("hi"));
@@ -1076,11 +1399,11 @@ mod tests {
     fn done_passthrough_after_flush() {
         let mut r = SseRechunker::new();
         let mut all = Vec::new();
-        all.extend_from_slice(r.feed(content_event("hi").as_bytes()).as_ref());
-        all.extend_from_slice(r.feed(b"data: [DONE]\n\n").as_ref());
+        all.extend_from_slice(r.feed(bytes(content_event("hi"))).as_ref());
+        all.extend_from_slice(r.feed(bytes(b"data: [DONE]\n\n")).as_ref());
         let text = String::from_utf8_lossy(&all).to_string();
         assert!(text.find("\"hi\"").unwrap() < text.find("[DONE]").unwrap());
-        assert_eq!(r.feed(b"trailing").as_ref(), b"trailing");
+        assert_eq!(r.feed(bytes(b"trailing")).as_ref(), b"trailing");
     }
 
     fn chunk(text: &str) -> Bytes {

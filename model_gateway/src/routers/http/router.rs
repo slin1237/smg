@@ -1269,7 +1269,7 @@ impl Router {
                                 Some(Ok(bytes)) if bytes.is_empty() => {}
                                 Some(Ok(bytes)) => {
                                     let bytes = match rechunker.as_mut() {
-                                        Some(r) => r.feed(&bytes),
+                                        Some(r) => r.feed(bytes),
                                         None => bytes,
                                     };
                                     if !bytes.is_empty() && tx.send(Ok(bytes)).await.is_err() {

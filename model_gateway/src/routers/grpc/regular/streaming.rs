@@ -26,9 +26,11 @@ use openai_protocol::{
         self, ContentBlock, ContentBlockDelta, Message, MessageDelta, MessageDeltaUsage,
         MessageStreamEvent,
     },
+    profile::ProviderProfile,
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
 use serde_json::{json, Value};
+use tokio_stream::wrappers::ReceiverStream;
 use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
 use tracing::{debug, error, warn};
 
@@ -36,9 +38,15 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     rate_limit::{SharedReservationHandle, UsageSettlement},
     routers::{
-        common::sse::{sse_channel, SseEncoder, SseSender},
+        common::{
+            sse::{sse_channel, SseEncoder, SseSender},
+            sse_rechunk,
+        },
         grpc::{
-            common::{response_formatting::CompletionTokenTracker, responses::build_sse_response},
+            common::{
+                response_formatting::CompletionTokenTracker,
+                responses::{build_sse_response, build_sse_response_from_stream},
+            },
             context,
             proto_wrapper::{ProtoResponseVariant, ProtoStream},
             spec::{
@@ -144,6 +152,11 @@ impl StreamingProcessor {
             chat_request.ignore_eos,
         );
 
+        // MiniMax's stream-QoS contract bounds per-event delta sizes. The HTTP
+        // relay re-slices the upstream body; here the gateway encodes the
+        // frames itself, so the channel is re-chunked on its way out.
+        let rechunk = chat_request.provider == ProviderProfile::Minimax;
+
         // Create SSE channel
         let (tx, rx) = sse_channel();
 
@@ -232,7 +245,11 @@ impl StreamingProcessor {
         }
 
         // Return SSE response
-        build_sse_response(rx)
+        if rechunk {
+            build_sse_response_from_stream(sse_rechunk::rechunk_stream(ReceiverStream::new(rx)))
+        } else {
+            build_sse_response(rx)
+        }
     }
 
     /// Process streaming chunks from a single stream (Regular mode)

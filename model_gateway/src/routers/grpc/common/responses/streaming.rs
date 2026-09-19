@@ -2,6 +2,7 @@
 
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
+use futures::Stream;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use openai_protocol::{
     chat::ChatCompletionStreamResponse,
@@ -1324,12 +1325,20 @@ impl ResponseStreamEventEmitter {
 /// Build a Server-Sent Events (SSE) response
 ///
 /// Creates a Response with proper SSE headers and streaming body.
+pub(crate) fn build_sse_response(rx: SseReceiver) -> Response {
+    build_sse_response_from_stream(ReceiverStream::new(rx))
+}
+
+/// [`build_sse_response`] over any body stream, for a channel that goes
+/// through an adapter (re-chunking, say) before it reaches the client.
 #[expect(
     clippy::expect_used,
     reason = "Response::builder with static headers and valid status code is infallible"
 )]
-pub(crate) fn build_sse_response(rx: SseReceiver) -> Response {
-    let stream = ReceiverStream::new(rx);
+pub(crate) fn build_sse_response_from_stream<S>(stream: S) -> Response
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
     Response::builder()
         .status(StatusCode::OK)
         .header(

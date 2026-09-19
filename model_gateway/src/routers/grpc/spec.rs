@@ -17,6 +17,7 @@ use openai_protocol::{
     completion::CompletionRequest,
     generate::GenerateRequest,
     messages::{self, CreateMessageRequest},
+    profile::ProviderProfile,
     responses::ResponsesRequest,
 };
 use serde_json::Value;
@@ -56,6 +57,9 @@ pub(crate) struct TranscriptionResponseSpec {
 
 #[derive(Clone)]
 pub(crate) struct ChatResponseSpec {
+    /// Provider dialect of the model the client asked for, as request
+    /// validation selects it; picks provider-specific response behaviour.
+    pub provider: ProviderProfile,
     pub separate_reasoning: bool,
     pub tool_choice: Option<ToolChoice>,
     pub tools: Option<Vec<Tool>>,
@@ -84,6 +88,7 @@ pub(crate) struct ChatResponseSpec {
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
     fn from(request: &ChatCompletionRequest) -> Self {
         Self {
+            provider: ProviderProfile::for_model(&request.model),
             separate_reasoning: request.separate_reasoning,
             tool_choice: request.tool_choice.clone(),
             // Every tool the model may call, dynamic tools declared on messages
@@ -297,5 +302,26 @@ mod tests {
         }));
 
         assert!(ChatResponseSpec::from(&request).tools.is_none());
+    }
+
+    #[test]
+    fn chat_spec_provider_follows_the_requested_model() {
+        let minimax = chat_request(json!({
+            "model": "MiniMax-M3",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        let openai = chat_request(json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+
+        assert_eq!(
+            ChatResponseSpec::from(&minimax).provider,
+            ProviderProfile::Minimax
+        );
+        assert_eq!(
+            ChatResponseSpec::from(&openai).provider,
+            ProviderProfile::OpenAi
+        );
     }
 }

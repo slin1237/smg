@@ -66,7 +66,7 @@ use crate::{
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, is_retryable_status, RetryExecutor},
             sse::SSE_CHANNEL_BUFFER,
-            sse_rechunk::SseRechunker,
+            sse_rechunk::{SseRechunker, IDLE_FLUSH},
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
@@ -95,10 +95,6 @@ const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 const STREAMED_BODY_STALLED: &str = "request_body_stalled";
 const STREAMED_BODY_TOO_LARGE: &str = "request_body_too_large";
 const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
-
-/// Pending re-chunked payload is flushed after this much upstream silence,
-/// so packet sizing never holds a slow stream's first token.
-const RECHUNK_IDLE_FLUSH: Duration = Duration::from_millis(250);
 
 /// How a worker response body is relayed to the client. Re-chunking exists
 /// on this regular HTTP relay only; the PD and gRPC relays do not apply it.
@@ -1259,13 +1255,13 @@ impl Router {
             tokio::spawn(async move {
                 let mut stream = stream;
                 // One timer, reset per chunk, instead of a fresh sleep per token.
-                let idle = tokio::time::sleep(RECHUNK_IDLE_FLUSH);
+                let idle = tokio::time::sleep(IDLE_FLUSH);
                 tokio::pin!(idle);
                 loop {
                     tokio::select! {
                         chunk = stream.next() => {
                             if rechunker.is_some() {
-                                idle.as_mut().reset(tokio::time::Instant::now() + RECHUNK_IDLE_FLUSH);
+                                idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
                             }
                             match chunk {
                                 // Same as the regular relay: an empty upstream chunk must
@@ -1300,7 +1296,7 @@ impl Router {
                             }
                         },
                         () = &mut idle, if rechunker.as_ref().is_some_and(SseRechunker::has_pending) => {
-                            idle.as_mut().reset(tokio::time::Instant::now() + RECHUNK_IDLE_FLUSH);
+                            idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
                             if let Some(tail) = rechunker.as_mut().map(SseRechunker::flush_pending) {
                                 if !tail.is_empty() && tx.send(Ok(tail)).await.is_err() {
                                     break;

@@ -16,10 +16,15 @@
 //! to byte pass-through, and a chunk carrying choice metadata such as
 //! `logprobs` is forwarded whole, so a stream that requests logprobs is not
 //! re-chunked in practice.
+//!
+//! Two relays use it: the HTTP proxy drives [`SseRechunker`] inline over the
+//! upstream body, and the gRPC pipeline wraps the frames it encodes itself in
+//! [`rechunk_stream`].
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, pin::Pin, time::Duration};
 
 use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use serde_json::{Map, Value};
 
 /// Emit buffered payload in slices of this many chars once at least
@@ -36,6 +41,10 @@ const MAX_FRAME_BYTES: usize = 1 << 20;
 
 /// Delta string fields subject to re-chunking, in emission order.
 const PAYLOAD_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "content"];
+
+/// Pending re-chunked payload is flushed after this much upstream silence,
+/// so packet sizing never holds a slow stream's first token.
+pub(crate) const IDLE_FLUSH: Duration = Duration::from_millis(250);
 
 /// One re-chunked payload buffer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -560,8 +569,90 @@ fn find_frame_end(raw: &[u8], from: usize) -> Option<(usize, usize)> {
     })
 }
 
+/// Re-chunk a stream of SSE body chunks: every chunk passes through an
+/// [`SseRechunker`], payload held back is flushed once the upstream has been
+/// silent for [`IDLE_FLUSH`], and the tail is flushed when the stream ends. An
+/// upstream error still follows whatever payload was pending.
+///
+/// The HTTP relay drives the re-chunker inline with its forwarding loop; this
+/// adapter serves streams the gateway encodes itself (the gRPC pipeline).
+pub(crate) fn rechunk_stream<S, E>(inner: S) -> impl Stream<Item = Result<Bytes, E>> + Send
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: Send + 'static,
+{
+    struct State<S, E> {
+        inner: S,
+        rechunker: SseRechunker,
+        /// One timer, reset per chunk, instead of a fresh sleep per token.
+        idle: Pin<Box<tokio::time::Sleep>>,
+        /// An upstream error, delivered after the flushed tail.
+        deferred: Option<E>,
+        ended: bool,
+    }
+
+    let state = State {
+        inner,
+        rechunker: SseRechunker::new(),
+        idle: Box::pin(tokio::time::sleep(IDLE_FLUSH)),
+        deferred: None,
+        ended: false,
+    };
+    futures::stream::unfold(state, |mut st| async move {
+        loop {
+            if let Some(err) = st.deferred.take() {
+                return Some((Err(err), st));
+            }
+            if st.ended {
+                return None;
+            }
+            tokio::select! {
+                chunk = st.inner.next() => match chunk {
+                    Some(Ok(bytes)) => {
+                        st.idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
+                        let out = st.rechunker.feed(&bytes);
+                        if !out.is_empty() {
+                            return Some((Ok(out), st));
+                        }
+                    }
+                    Some(Err(err)) => {
+                        st.ended = true;
+                        let tail = st.rechunker.finish();
+                        if tail.is_empty() {
+                            return Some((Err(err), st));
+                        }
+                        st.deferred = Some(err);
+                        return Some((Ok(tail), st));
+                    }
+                    None => {
+                        st.ended = true;
+                        let tail = st.rechunker.finish();
+                        if tail.is_empty() {
+                            return None;
+                        }
+                        return Some((Ok(tail), st));
+                    }
+                },
+                () = st.idle.as_mut(), if st.rechunker.has_pending() => {
+                    st.idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
+                    let out = st.rechunker.flush_pending();
+                    if !out.is_empty() {
+                        return Some((Ok(out), st));
+                    }
+                }
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io;
+
+    use futures::stream;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+
     use super::*;
 
     fn events(bytes: &[u8]) -> Vec<Value> {
@@ -990,5 +1081,63 @@ mod tests {
         let text = String::from_utf8_lossy(&all).to_string();
         assert!(text.find("\"hi\"").unwrap() < text.find("[DONE]").unwrap());
         assert_eq!(r.feed(b"trailing").as_ref(), b"trailing");
+    }
+
+    fn chunk(text: &str) -> Bytes {
+        Bytes::from(content_event(text))
+    }
+
+    fn contents(frames: &[Bytes]) -> Vec<String> {
+        let mut all = Vec::new();
+        for frame in frames {
+            all.extend_from_slice(frame);
+        }
+        events(&all)
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_adapter_merges_tiny_deltas_and_flushes_the_tail() {
+        let upstream = stream::iter((0..100).map(|_| Ok::<_, io::Error>(chunk("ab"))));
+        let frames: Vec<Bytes> = rechunk_stream(upstream)
+            .map(|frame| frame.unwrap())
+            .collect()
+            .await;
+        let sizes: Vec<usize> = contents(&frames)
+            .iter()
+            .map(|c| c.chars().count())
+            .collect();
+        assert!(
+            sizes.iter().all(|&s| s >= MIN_TAIL_CHARS),
+            "sizes: {sizes:?}"
+        );
+        assert_eq!(sizes.iter().sum::<usize>(), 200);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_adapter_flushes_pending_payload_when_upstream_idles() {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(8);
+        let mut out = Box::pin(rechunk_stream(ReceiverStream::new(rx)));
+        for _ in 0..3 {
+            tx.send(Ok(chunk("ab"))).await.unwrap();
+        }
+        // Below the emit threshold: only the idle timer releases it.
+        let frame = out.next().await.unwrap().unwrap();
+        assert_eq!(contents(&[frame]), vec!["ababab"]);
+        drop(tx);
+        assert!(out.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_adapter_delivers_the_tail_before_an_upstream_error() {
+        let upstream = stream::iter(vec![Ok(chunk("ab")), Err(io::Error::other("boom"))]);
+        let mut out = Box::pin(rechunk_stream(upstream));
+        let tail = out.next().await.unwrap().unwrap();
+        assert_eq!(contents(&[tail]), vec!["ab"]);
+        assert!(out.next().await.unwrap().is_err());
+        assert!(out.next().await.is_none());
     }
 }

@@ -343,8 +343,16 @@ impl TiktokenTokenizer {
             })
         };
 
-        // Load merged EOS token IDs from config.json + generation_config.json
-        let eos_token_ids = crate::eos::load_eos_token_ids(dir);
+        // Load merged EOS token IDs from config.json + generation_config.json,
+        // plus the tokenizer's own eos_token (structured-output grammars end on it).
+        let eos_token_ids = crate::eos::with_tokenizer_eos(
+            crate::eos::load_eos_token_ids(dir),
+            config
+                .special_tokens
+                .eos_token
+                .as_deref()
+                .and_then(|token| vocab.get(token).copied()),
+        );
 
         // Detect which chat-template renderer to use based on config.json::architectures
         let renderer = detect_renderer_from_config(dir);

@@ -262,11 +262,18 @@ impl HuggingFaceTokenizer {
             }
         }
 
-        // Load merged EOS token IDs from config.json + generation_config.json
-        let eos_token_ids = tokenizer_path
-            .parent()
-            .map(crate::eos::load_eos_token_ids)
-            .unwrap_or_default();
+        // Load merged EOS token IDs from config.json + generation_config.json,
+        // plus the tokenizer's own eos_token (structured-output grammars end on it).
+        let eos_token_ids = crate::eos::with_tokenizer_eos(
+            tokenizer_path
+                .parent()
+                .map(crate::eos::load_eos_token_ids)
+                .unwrap_or_default(),
+            special_tokens
+                .eos_token
+                .as_deref()
+                .and_then(|token| vocab.get(token).copied()),
+        );
 
         // Detect a custom Python-encoder model from config.json::architectures.
         let renderer = tokenizer_path

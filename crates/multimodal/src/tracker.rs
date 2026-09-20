@@ -381,8 +381,16 @@ mod video_param_tests {
             VideoFetchConfig::default().sample_fps
         );
 
+        // A model's own default is held to the same range as a requested one,
+        // right up to the edge of it: nothing reaches sampling unchecked just
+        // because the model named it rather than the caller.
         assert!(video_fetch_config(Some(100.0), None, Some(1.0)).is_err());
-        assert!(video_fetch_config(None, None, Some(100.0)).is_err());
+        for bad_default in [100.0, 5.1, 0.19, 0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                video_fetch_config(None, None, Some(bad_default)).is_err(),
+                "{bad_default}"
+            );
+        }
     }
 
     #[test]

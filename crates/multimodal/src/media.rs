@@ -541,6 +541,7 @@ impl MediaConnector {
             &bytes,
             cfg.sample_fps,
             cfg.max_long_side_pixel,
+            cfg.sampling,
         );
         let decoded = decode_video_frames(bytes.clone(), cfg).await?;
         // Cap here rather than in the ffmpeg filter chain: the rawvideo decoder

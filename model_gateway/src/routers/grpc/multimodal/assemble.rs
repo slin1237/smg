@@ -413,6 +413,11 @@ fn assemble_tokenspeed_with_options(
     // cleanup, leaking files until the next sweep.
     let mut ordered_bindings = intermediate.bindings.iter().collect::<Vec<_>>();
     ordered_bindings.sort_by_key(|binding| binding.prompt_ordinal);
+    // Checked before the item loop, while a plain `?` still costs nothing: no
+    // /dev/shm segment has been created yet.
+    for binding in &ordered_bindings {
+        ensure_structural_fallback_covers_features(intermediate, binding)?;
+    }
     let mut items: Vec<TokenSpeedMultimodalItem> = Vec::with_capacity(item_count);
     for binding in ordered_bindings {
         let item_index = binding.item_index;
@@ -793,6 +798,41 @@ fn placeholders_for_bindings(
         .collect()
 }
 
+/// Check the ranges an item falls back to when it declares no patches.
+///
+/// An item without patches is sent as its whole structural range, so that
+/// range has to hold exactly as many prompt positions as the item has encoder
+/// features. Items that do declare patches are already covered by
+/// [`validate_precomputed_batch`], and the vLLM path is exempt: it sends the
+/// structural range on purpose and lets the backend pick the feature positions
+/// out of it.
+fn ensure_structural_fallback_covers_features(
+    intermediate: &PrecomputedMultimodalIntermediate,
+    binding: &PromptBinding,
+) -> Result<()> {
+    if !binding.patches.is_empty() {
+        return Ok(());
+    }
+    let modality = intermediate.media.modality();
+    let features = *intermediate
+        .preprocessed
+        .feature_token_counts
+        .get(binding.item_index)
+        .with_context(|| {
+            format!(
+                "missing {modality} feature count for item {}",
+                binding.item_index
+            )
+        })?;
+    anyhow::ensure!(
+        binding.structural.length == features,
+        "precomputed {modality} item {} covers {} prompt positions for {features} encoder features",
+        binding.item_index,
+        binding.structural.length
+    );
+    Ok(())
+}
+
 fn placeholders_for_binding(
     binding: &PromptBinding,
     prefer_patches: bool,
@@ -1042,6 +1082,89 @@ mod tests {
             second.model_specific_tensors["image_grid_thw"].shape,
             vec![1, 3]
         );
+    }
+
+    /// One image with two encoder features, bound to a structural range of
+    /// `structural_length` and the given patch ranges.
+    fn one_image_intermediate(
+        structural_length: usize,
+        patches: Vec<PlaceholderRange>,
+    ) -> PrecomputedMultimodalIntermediate {
+        let mut model_specific = HashMap::new();
+        model_specific.insert(
+            "patches_per_image".to_string(),
+            ModelSpecificValue::UintTensor {
+                data: vec![2],
+                shape: vec![1],
+            },
+        );
+
+        PrecomputedMultimodalIntermediate {
+            preprocessed: PreprocessedEncoderInputs {
+                encoder_input: ArrayD::from_shape_vec(IxDyn(&[2, 2]), vec![1.0, 2.0, 3.0, 4.0])
+                    .unwrap(),
+                feature_token_counts: vec![2],
+                item_sizes: vec![(1, 1)],
+                model_specific,
+            },
+            media: MediaBatch::Images(vec![Arc::new(ImageFrame::new(
+                image::DynamicImage::new_rgb8(1, 1),
+                bytes::Bytes::from_static(b"a"),
+                ImageDetail::Auto,
+                llm_multimodal::ImageSource::InlineBytes,
+                "hash-a".to_string(),
+            ))]),
+            bindings: vec![PromptBinding {
+                item_index: 0,
+                prompt_ordinal: 0,
+                structural: PlaceholderRange {
+                    offset: 10,
+                    length: structural_length,
+                },
+                patches,
+            }],
+            placeholder_token_id: Some(151655),
+            field_layouts: EncoderFieldLayouts::new(
+                FieldLayout::flat("patches_per_image"),
+                HashMap::from([("patches_per_image".to_string(), FieldLayout::Batched)]),
+            ),
+            keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
+        }
+    }
+
+    /// An item with no patches is sent as its whole structural range, so a
+    /// range that does not match the item's feature count would hand the
+    /// backend the wrong prompt positions.
+    #[test]
+    fn a_patchless_item_is_rejected_when_its_range_misses_the_features() {
+        let good = one_image_intermediate(2, vec![]);
+        let assembled = assemble_tokenspeed(&good, None, false).unwrap();
+        assert_eq!(assembled.items[0].mm_placeholders, vec![(10, 2)]);
+
+        let bad = one_image_intermediate(3, vec![]);
+        let error = assemble_tokenspeed(&bad, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("3 prompt positions for 2 encoder features"),
+            "{error}"
+        );
+    }
+
+    /// The same mismatch is fine once the item declares patches: those are the
+    /// ranges that get sent, and they already carry the feature count.
+    #[test]
+    fn a_patched_item_may_span_a_wider_structural_range() {
+        let intermediate = one_image_intermediate(
+            5,
+            vec![PlaceholderRange {
+                offset: 11,
+                length: 2,
+            }],
+        );
+        let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
+        assert_eq!(assembled.items[0].mm_placeholders, vec![(11, 2)]);
     }
 
     #[test]

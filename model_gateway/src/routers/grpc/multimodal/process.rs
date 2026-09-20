@@ -49,8 +49,32 @@ pub(crate) async fn process_multimodal_plan(
 ) -> Result<MultimodalOutput> {
     let log_timing = log_mm_timing_enabled();
     let total_started = Instant::now();
+
+    // Step 1: Resolve the model spec; it decides how media is fetched.
+    let config_started = Instant::now();
+    let model_config = components
+        .config_registry
+        .get_or_load(tokenizer_id, tokenizer_source)
+        .await?;
+    let model_type = model_config
+        .config
+        .get("model_type")
+        .and_then(|v| v.as_str());
+    let registry_tokenizer = RegistryTokenizer(tokenizer);
+    let metadata = ModelMetadata {
+        model_id,
+        tokenizer: &registry_tokenizer,
+        config: &model_config.config,
+    };
+    let spec = components
+        .model_registry
+        .lookup(&metadata)
+        .ok_or_else(|| anyhow::anyhow!("Multimodal not supported for model: {model_id}"))?;
+    let config_elapsed_ms = config_started.elapsed().as_secs_f64() * 1000.0;
+
     let media_started = Instant::now();
-    let mut tracker = AsyncMultiModalTracker::new(components.media_connector.clone());
+    let mut tracker = AsyncMultiModalTracker::new(components.media_connector.clone())
+        .with_default_video_sample_fps(spec.default_video_sample_fps());
 
     for part in plan.into_parts() {
         tracker
@@ -163,28 +187,7 @@ pub(crate) async fn process_multimodal_plan(
         }
     }
 
-    // Step 2: Resolve model spec and preprocess media.
-    let config_started = Instant::now();
-    let model_config = components
-        .config_registry
-        .get_or_load(tokenizer_id, tokenizer_source)
-        .await?;
-    let model_type = model_config
-        .config
-        .get("model_type")
-        .and_then(|v| v.as_str());
-    let registry_tokenizer = RegistryTokenizer(tokenizer);
-    let metadata = ModelMetadata {
-        model_id,
-        tokenizer: &registry_tokenizer,
-        config: &model_config.config,
-    };
-    let spec = components
-        .model_registry
-        .lookup(&metadata)
-        .ok_or_else(|| anyhow::anyhow!("Multimodal not supported for model: {model_id}"))?;
-    let config_elapsed_ms = config_started.elapsed().as_secs_f64() * 1000.0;
-
+    // Step 2: Preprocess media.
     let preprocess_started = Instant::now();
     let mut prepared_parts = Vec::with_capacity(media_batches.len());
     // Every modality batch is independent until prompt expansion. Poll all

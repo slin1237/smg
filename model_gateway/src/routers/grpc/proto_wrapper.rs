@@ -2998,6 +2998,7 @@ mod tests {
             image_data: vec![vec![0; 2]],
             pixel_values: vec![0; 16],
             pixel_values_shape: vec![4, 4],
+            pixel_values_dtype: "float32".to_string(),
             model_specific_tensors: HashMap::from([(
                 "grid".to_string(),
                 TensorBytes {

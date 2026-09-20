@@ -102,6 +102,7 @@ impl GrpcRouter {
             MultimodalComponents::new(
                 ctx.multimodal_config_registry.clone(),
                 ctx.router_config.mm_per_request_image_limit,
+                ctx.router_config.multimodal_max_inflight_bytes,
             )
             .map_err(|e| format!("multimodal components: {e:#}"))?,
         ));

@@ -315,6 +315,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Most bytes of preprocessed media held in flight for engines at once.
+    pub fn multimodal_max_inflight_bytes(mut self, bytes: Option<usize>) -> Self {
+        self.config.multimodal_max_inflight_bytes = bytes;
+        self
+    }
+
     /// Per-request image-count limit replacing each model spec's built-in limit.
     pub fn mm_per_request_image_limit(mut self, limit: Option<usize>) -> Self {
         self.config.mm_per_request_image_limit = limit;

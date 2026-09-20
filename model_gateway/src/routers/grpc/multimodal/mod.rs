@@ -52,6 +52,7 @@ mod assemble;
 mod capability;
 mod config;
 mod detect;
+mod inflight;
 mod pixel_cache;
 mod plan;
 mod process;
@@ -69,6 +70,7 @@ pub(crate) use config::{
     MultimodalConfigRegistry, MultimodalModelConfig,
 };
 pub(crate) use detect::{media_plan_chat, media_plan_messages};
+pub(crate) use inflight::{reserve_multimodal_inflight, InflightPermit};
 pub(crate) use plan::{
     prepare_placeholder_tokens, resolve_media_part_order, validate_rendered_media_anchors,
     MediaPlan, PlaceholderTokens,

@@ -99,6 +99,49 @@ pub enum MultimodalData {
     TokenSpeed(TokenSpeedMultimodalData),
 }
 
+impl MultimodalData {
+    /// Bytes of media the request body itself carries.
+    pub fn inline_bytes(&self) -> usize {
+        match self {
+            Self::Sglang(data) => {
+                data.image_data.iter().map(Vec::len).sum::<usize>()
+                    + data.pixel_values.len()
+                    + tensor_bytes(&data.model_specific_tensors)
+            }
+            Self::Vllm(data) => data.inline_bytes(),
+            Self::Trtllm(data) => data.image_data.iter().map(Vec::len).sum(),
+            Self::TokenSpeed(data) => data
+                .items
+                .iter()
+                .map(|item| {
+                    let encoder = match &item.encoder_input.storage {
+                        TokenSpeedTensorStorage::Inline(bytes) => bytes.len(),
+                        TokenSpeedTensorStorage::Shm(_) | TokenSpeedTensorStorage::Remote(_) => 0,
+                    };
+                    encoder + tensor_bytes(&item.model_specific_tensors)
+                })
+                .sum(),
+        }
+    }
+}
+
+fn tensor_bytes(tensors: &HashMap<String, TensorBytes>) -> usize {
+    tensors.values().map(|tensor| tensor.data.len()).sum()
+}
+
+impl VllmMultimodalData {
+    /// Bytes of this batch and of every batch travelling with it.
+    pub fn inline_bytes(&self) -> usize {
+        self.pixel_values.len()
+            + tensor_bytes(&self.model_specific_tensors)
+            + self
+                .extra_batches
+                .iter()
+                .map(Self::inline_bytes)
+                .sum::<usize>()
+    }
+}
+
 /// SGLang multimodal data: preprocessed tensors with patch-only placeholders.
 #[derive(Debug)]
 pub struct SglangMultimodalData {
@@ -2939,6 +2982,50 @@ mod engine_error_tests {
 #[cfg(test)]
 mod tests {
     use prost::Message;
+
+    #[test]
+    fn inline_bytes_counts_every_inline_tensor_and_raw_image() {
+        let trtllm = MultimodalData::Trtllm(TrtllmMultimodalData {
+            image_data: vec![vec![0; 3], vec![0; 5]],
+        });
+        assert_eq!(trtllm.inline_bytes(), 8);
+
+        let sglang = MultimodalData::Sglang(SglangMultimodalData {
+            image_data: vec![vec![0; 2]],
+            pixel_values: vec![0; 16],
+            pixel_values_shape: vec![4, 4],
+            model_specific_tensors: HashMap::from([(
+                "grid".to_string(),
+                TensorBytes {
+                    data: vec![0; 24],
+                    shape: vec![1, 3],
+                    dtype: "int64".to_string(),
+                },
+            )]),
+            im_token_id: None,
+            mm_placeholders: vec![(0, 4)],
+        });
+        assert_eq!(sglang.inline_bytes(), 42);
+    }
+
+    #[test]
+    fn inline_bytes_counts_every_batch_of_a_mixed_request() {
+        let alone = MultimodalData::Vllm(vllm_mm_data(common::Modality::Image));
+        assert_eq!(alone.inline_bytes(), 16);
+
+        let mut video = vllm_mm_data(common::Modality::Video);
+        video.model_specific_tensors.insert(
+            "video_grid_thw".to_string(),
+            TensorBytes {
+                data: vec![0; 24],
+                shape: vec![1, 3],
+                dtype: "int64".to_string(),
+            },
+        );
+        let mut image = vllm_mm_data(common::Modality::Image);
+        image.extra_batches = vec![video];
+        assert_eq!(MultimodalData::Vllm(image).inline_bytes(), 56);
+    }
 
     use super::*;
 

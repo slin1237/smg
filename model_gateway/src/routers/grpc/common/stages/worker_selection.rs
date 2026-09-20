@@ -1534,6 +1534,7 @@ mod tests {
             encode_outputs: None,
             dispatch: None,
             load_guards: None,
+            multimodal_inflight: None,
             response: Default::default(),
         }
     }

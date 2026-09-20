@@ -1468,6 +1468,7 @@ class TestRouterArgsFieldOrder:
         "enable_rl",
         "rl_control_timeout_secs",
         "rl_fanout_concurrency",
+        "multimodal_max_inflight_bytes",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

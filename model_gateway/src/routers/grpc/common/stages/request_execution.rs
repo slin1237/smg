@@ -291,7 +291,10 @@ pub(crate) async fn execute_plan(
         }
     }
     .instrument(span)
-    .await?;
+    .await;
+    // The engines hold the request bodies now.
+    ctx.multimodal_inflight.take();
+    let result = result?;
 
     // Store result in context for response processing
     ctx.response.execution_result = Some(result);

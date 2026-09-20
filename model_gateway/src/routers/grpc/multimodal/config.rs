@@ -17,6 +17,7 @@ use openai_protocol::worker::MmProcessingMode;
 use tracing::{debug, warn};
 
 use super::{
+    inflight::MultimodalInflight,
     pixel_cache::{pixel_cache_from_env, PixelCache},
     refs::MmProcessing,
 };
@@ -255,6 +256,8 @@ pub(crate) struct MultimodalComponents {
     pub processing: MmProcessingMode,
     /// Last resolved (location, reason) per model, to warn once per change.
     pub mm_mode_log: Mutex<HashMap<String, (MmProcessing, &'static str)>>,
+    /// Cap on preprocessed media bytes in flight; `None` leaves it unbounded.
+    pub inflight: Option<Arc<MultimodalInflight>>,
 }
 
 /// Router-wide multimodal processing mode from `SMG_MM_PROCESSING` (default `auto`).
@@ -282,6 +285,7 @@ impl MultimodalComponents {
     pub fn new(
         config_registry: Arc<MultimodalConfigRegistry>,
         image_limit_override: Option<usize>,
+        max_inflight_bytes: Option<usize>,
     ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -304,6 +308,9 @@ impl MultimodalComponents {
                 .unwrap_or_default(),
             processing,
             mm_mode_log: Mutex::new(HashMap::new()),
+            inflight: max_inflight_bytes
+                .filter(|bytes| *bytes > 0)
+                .map(|bytes| Arc::new(MultimodalInflight::new(bytes))),
         })
     }
 }

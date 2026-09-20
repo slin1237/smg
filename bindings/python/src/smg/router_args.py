@@ -80,6 +80,7 @@ class RouterArgs:
     dp_aware: bool = False
     multimodal_tensor_transport: str | None = None
     multimodal_shm_min_bytes: int | None = None
+    multimodal_max_inflight_bytes: int | None = None
     routing_key_override: bool = False
     dp_minimum_tokens_scheduler: bool = False
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
@@ -918,6 +919,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.multimodal_shm_min_bytes,
             help="Minimum multimodal tensor size (bytes) before the SHM transport is used",
+        )
+        parser.add_argument(
+            f"--{prefix}multimodal-max-inflight-bytes",
+            type=int,
+            default=RouterArgs.multimodal_max_inflight_bytes,
+            help="Most bytes of preprocessed media held in flight for engines at once; requests past it wait briefly, then get 429",
         )
         parser.add_argument(
             f"--{prefix}mm-per-request-image-limit",

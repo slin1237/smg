@@ -15,6 +15,7 @@ use crate::routers::{
         },
         multimodal::{
             assemble_media_refs, assemble_multimodal_data, assemble_multimodal_data_after_encode,
+            reserve_multimodal_inflight,
         },
         spec::{MessagesResponseSpec, ResponseSpec},
         utils,
@@ -117,6 +118,16 @@ impl BuildStage for MessageRequestBuildingStage {
         } else {
             None
         };
+        if let Some(data) = multimodal_data.as_ref() {
+            ctx.state.multimodal_inflight = reserve_multimodal_inflight(
+                ctx.components
+                    .multimodal
+                    .as_ref()
+                    .and_then(|multimodal| multimodal.inflight.as_deref()),
+                data.inline_bytes(),
+            )
+            .await?;
+        }
 
         // A structural tag that already opens with the reasoning block runs
         // from the first token; asking SGLang to also defer the grammar past

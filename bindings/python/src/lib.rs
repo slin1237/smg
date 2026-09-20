@@ -503,6 +503,7 @@ struct Router {
     encode_policy: Option<PolicyType>,
     multimodal_tensor_transport: Option<String>,
     multimodal_shm_min_bytes: Option<usize>,
+    multimodal_max_inflight_bytes: Option<usize>,
     model_aliases: HashMap<String, String>,
     worker_startup_delay: u64,
     worker_ports_annotation: String,
@@ -928,6 +929,7 @@ impl Router {
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
+            .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
             .mm_per_request_image_limit(self.mm_per_request_image_limit)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
@@ -1083,6 +1085,7 @@ impl Router {
         encode_policy = None,
         multimodal_tensor_transport = None,
         multimodal_shm_min_bytes = None,
+        multimodal_max_inflight_bytes = None,
         model_aliases = HashMap::new(),
         worker_startup_delay = 0,
         worker_ports_annotation = String::from("smg.ai/worker-ports"),
@@ -1243,6 +1246,7 @@ impl Router {
         encode_policy: Option<PolicyType>,
         multimodal_tensor_transport: Option<String>,
         multimodal_shm_min_bytes: Option<usize>,
+        multimodal_max_inflight_bytes: Option<usize>,
         model_aliases: HashMap<String, String>,
         worker_startup_delay: u64,
         worker_ports_annotation: String,
@@ -1420,6 +1424,7 @@ impl Router {
             encode_policy,
             multimodal_tensor_transport,
             multimodal_shm_min_bytes,
+            multimodal_max_inflight_bytes,
             model_aliases,
             worker_startup_delay,
             worker_ports_annotation,

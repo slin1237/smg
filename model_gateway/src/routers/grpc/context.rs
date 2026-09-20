@@ -30,7 +30,7 @@ use super::{
         helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask},
         RateLimitCell,
     },
-    multimodal::{MediaPlan, MultimodalComponents, MultimodalIntermediate},
+    multimodal::{InflightPermit, MediaPlan, MultimodalComponents, MultimodalIntermediate},
     proto_wrapper::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
         ProtoRequest, ProtoStream,
@@ -200,6 +200,10 @@ pub(crate) struct ProcessingState {
     /// prefill pixels; request execution `take()`s the dispatch plan.
     pub encode_outputs: Option<EncodeOutputs>,
 
+    /// Share of the in-flight media budget this request holds until the
+    /// engines have its body.
+    pub multimodal_inflight: Option<InflightPermit>,
+
     /// Resolved tokenizer (set once in preparation, reused in response processing)
     /// This avoids redundant registry lookups across pipeline stages.
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
@@ -281,6 +285,7 @@ pub(crate) struct DispatchContext {
     /// Consumed by the first dispatch; retries re-dispatch only the
     /// prefill/decode legs against the already-running encode jobs.
     pub encode_outputs: Option<EncodeOutputs>,
+    pub multimodal_inflight: Option<InflightPermit>,
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
     pub response: ResponseState,
@@ -843,6 +848,7 @@ impl RequestContext {
             sticky_key: state.sticky_key,
             clients: state.clients,
             encode_outputs: state.encode_outputs,
+            multimodal_inflight: state.multimodal_inflight,
             dispatch: None,
             load_guards: None,
             response: state.response,

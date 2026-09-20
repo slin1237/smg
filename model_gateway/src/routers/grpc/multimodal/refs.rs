@@ -423,7 +423,7 @@ mod tests {
 
     fn components(mode: MmProcessingMode) -> MultimodalComponents {
         let mut components =
-            MultimodalComponents::new(Arc::new(MultimodalConfigRegistry::new()), None)
+            MultimodalComponents::new(Arc::new(MultimodalConfigRegistry::new()), None, None)
                 .expect("components");
         components.processing = mode;
         components

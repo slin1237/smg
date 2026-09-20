@@ -25,7 +25,10 @@ use super::{
         model_specific_to_tensor_bytes, serialize_array_as_tokenspeed_tensor,
         serialize_encoder_input, serialize_model_specific, slice_array_axis0,
     },
-    transport::{mm_encoder_input_dtype, resolve_mm_shm_enabled, resolve_mm_shm_min_bytes},
+    transport::{
+        mm_encoder_input_dtype, mm_vllm_encoder_input_dtype, resolve_mm_shm_enabled,
+        resolve_mm_shm_min_bytes,
+    },
     MediaBatch, MultimodalIntermediate, PrecomputedMultimodalIntermediate, PromptBinding,
 };
 use crate::{
@@ -247,7 +250,11 @@ fn ensure_client_supports_intermediate(
 fn assemble_sglang(
     intermediate: PrecomputedMultimodalIntermediate,
 ) -> Result<SglangMultimodalData> {
-    let (pixel_values, pixel_values_shape) = serialize_encoder_input(&intermediate.preprocessed);
+    // Pinned to float32. An SGLang worker reads a dtype it does not recognise as
+    // float32 anyway, so a narrower width would be misread as numbers rather
+    // than refused, and nothing on this wire reports which widths it accepts.
+    let (pixel_values, pixel_values_shape, pixel_values_dtype) =
+        serialize_encoder_input(&intermediate.preprocessed, "float32");
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
     let MediaBatch::Images(images) = &intermediate.media else {
         anyhow::bail!("SGLang assembly requires an image batch");
@@ -259,6 +266,7 @@ fn assemble_sglang(
         image_data,
         pixel_values,
         pixel_values_shape,
+        pixel_values_dtype,
         model_specific_tensors,
         im_token_id: intermediate.placeholder_token_id,
         mm_placeholders,
@@ -269,7 +277,10 @@ fn assemble_vllm(
     intermediate: PrecomputedMultimodalIntermediate,
     workers: Option<&WorkerSelection>,
 ) -> Result<VllmMultimodalData> {
-    let (pixel_values, pixel_values_shape) = serialize_encoder_input(&intermediate.preprocessed);
+    let (pixel_values, pixel_values_shape, pixel_values_dtype) = serialize_encoder_input(
+        &intermediate.preprocessed,
+        &mm_vllm_encoder_input_dtype(workers),
+    );
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
     let (modality, mm_hashes) = match &intermediate.media {
         MediaBatch::Images(images) => (
@@ -297,6 +308,7 @@ fn assemble_vllm(
     Ok(VllmMultimodalData {
         pixel_values,
         pixel_values_shape,
+        pixel_values_dtype,
         model_specific_tensors,
         im_token_id: intermediate.placeholder_token_id,
         mm_placeholders,

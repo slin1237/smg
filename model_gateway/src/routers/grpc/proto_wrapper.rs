@@ -105,6 +105,8 @@ pub struct SglangMultimodalData {
     pub image_data: Vec<Vec<u8>>,
     pub pixel_values: Vec<u8>,
     pub pixel_values_shape: Vec<u32>,
+    /// The width `pixel_values` was written in, which the receiver reads it at.
+    pub pixel_values_dtype: String,
     pub model_specific_tensors: HashMap<String, TensorBytes>,
     pub im_token_id: Option<u32>,
     /// Patch-only placeholder offsets aligned 1:1 with vision encoder output.
@@ -116,6 +118,8 @@ pub struct SglangMultimodalData {
 pub struct VllmMultimodalData {
     pub pixel_values: Vec<u8>,
     pub pixel_values_shape: Vec<u32>,
+    /// The width `pixel_values` was written in, which the receiver reads it at.
+    pub pixel_values_dtype: String,
     pub model_specific_tensors: HashMap<String, TensorBytes>,
     pub im_token_id: Option<u32>,
     /// Full structural placeholder offsets (vLLM filters via is_embed mask).
@@ -277,7 +281,7 @@ impl SglangMultimodalData {
             pixel_values: Some(sglang::TensorData {
                 data: self.pixel_values,
                 shape: self.pixel_values_shape,
-                dtype: "float32".to_string(),
+                dtype: self.pixel_values_dtype,
             }),
             model_specific_tensors,
             im_token_id: self.im_token_id,
@@ -337,7 +341,7 @@ impl VllmMultimodalData {
         vllm::MultimodalInputs {
             pixel_values: Some(vllm::TensorData {
                 shape: self.pixel_values_shape,
-                dtype: "float32".to_string(),
+                dtype: self.pixel_values_dtype,
                 payload: Some(vllm_tensor_payload(
                     self.pixel_values,
                     shm_enabled,
@@ -3180,6 +3184,7 @@ mod tests {
         VllmMultimodalData {
             pixel_values: vec![0u8; 16],
             pixel_values_shape: vec![1, 4],
+            pixel_values_dtype: "float32".to_string(),
             model_specific_tensors: HashMap::new(),
             im_token_id: Some(if is_video { 151656 } else { 151655 }),
             mm_placeholders: vec![(3, 4)],

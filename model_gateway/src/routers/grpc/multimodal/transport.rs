@@ -361,6 +361,33 @@ fn primary_worker(workers: Option<&WorkerSelection>) -> Option<&Arc<dyn crate::w
     }
 }
 
+/// The wire dtype for the vLLM encoder input.
+///
+/// Defaults to float32 rather than to the narrower width the TokenSpeed path
+/// prefers: a worker only reads the bytes at the width it already knows, so the
+/// router keeps sending the widest one until it is told the other end reads
+/// something else.
+pub(super) fn mm_vllm_encoder_input_dtype(workers: Option<&WorkerSelection>) -> String {
+    resolve_mm_vllm_encoder_input_dtype(
+        mm_vllm_encoder_input_dtype_from_env(),
+        mm_encoder_input_dtype_from_worker(workers),
+    )
+}
+
+fn resolve_mm_vllm_encoder_input_dtype(
+    override_dtype: Option<String>,
+    worker_dtype: Option<String>,
+) -> String {
+    override_dtype
+        .or(worker_dtype)
+        .unwrap_or_else(|| "float32".to_string())
+}
+
+fn mm_vllm_encoder_input_dtype_from_env() -> Option<String> {
+    static DTYPE: OnceLock<Option<String>> = OnceLock::new();
+    cached_env_dtype(&DTYPE, "SMG_VLLM_ENCODER_INPUT_DTYPE")
+}
+
 pub(super) fn mm_encoder_input_dtype(
     modality: Modality,
     workers: Option<&WorkerSelection>,
@@ -559,6 +586,26 @@ mod tests {
             "bfloat16"
         );
         assert_eq!(resolve_mm_encoder_input_dtype(None, None, None), "bfloat16");
+    }
+
+    /// The vLLM wire starts from the widest dtype and narrows only when asked,
+    /// the opposite of the TokenSpeed default above. A worker reads the bytes at
+    /// whatever width it knows, so guessing a narrower one turns every media
+    /// request against an older worker into a failure or worse.
+    #[test]
+    fn vllm_dtype_stays_float32_until_something_asks_for_narrower() {
+        assert_eq!(resolve_mm_vllm_encoder_input_dtype(None, None), "float32");
+        assert_eq!(
+            resolve_mm_vllm_encoder_input_dtype(None, Some("bfloat16".to_string())),
+            "bfloat16"
+        );
+        assert_eq!(
+            resolve_mm_vllm_encoder_input_dtype(
+                Some("float16".to_string()),
+                Some("bfloat16".to_string()),
+            ),
+            "float16"
+        );
     }
 
     /// The derived slot TTL must strictly exceed the worker's max hold, so the

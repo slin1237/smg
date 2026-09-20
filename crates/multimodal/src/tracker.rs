@@ -310,6 +310,7 @@ fn video_fetch_config(
         Some(fps) => cfg.sample_fps = validate_sample_fps(fps)? as f32,
         None => {
             if let Some(default) = default_sample_fps {
+                validate_sample_fps(f64::from(default))?;
                 cfg.sample_fps = default;
             }
         }
@@ -381,6 +382,7 @@ mod video_param_tests {
         );
 
         assert!(video_fetch_config(Some(100.0), None, Some(1.0)).is_err());
+        assert!(video_fetch_config(None, None, Some(100.0)).is_err());
     }
 
     #[test]

@@ -208,16 +208,27 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         """
         await self._mm_inflight.acquire()
         running = asyncio.ensure_future(asyncio.to_thread(work, *args))
+        # Kept so the callback below can tell whether a caller is still waiting.
+        shielded = asyncio.shield(running)
 
         def finished(done: asyncio.Future) -> None:
             self._mm_inflight.release()
-            if not done.cancelled():
-                # Nobody may be left to read a failure; take it here so the
-                # loop does not report it as never retrieved.
-                done.exception()
+            if done.cancelled():
+                return
+            # Nobody may be left to read a failure; take it here so the
+            # loop does not report it as never retrieved.
+            error = done.exception()
+            if error is not None and shielded.cancelled():
+                # A cancelled caller has no RPC left to fail, so the log is the
+                # only place this failure can still be seen.
+                logger.error(
+                    "Multimodal work %s failed after its caller went away",
+                    getattr(work, "__name__", work),
+                    exc_info=error,
+                )
 
         running.add_done_callback(finished)
-        return await asyncio.shield(running)
+        return await shielded
 
     async def Generate(
         self,

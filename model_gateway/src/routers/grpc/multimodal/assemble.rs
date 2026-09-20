@@ -711,7 +711,7 @@ fn validate_precomputed_batch(intermediate: &PrecomputedMultimodalIntermediate) 
                     )
                 })?;
             anyhow::ensure!(
-                reserved == features,
+                features_fit_reservation(reserved, features),
                 "precomputed {modality} item {} reserves {reserved} prompt positions for {features} encoder features",
                 binding.item_index
             );
@@ -825,12 +825,23 @@ fn ensure_structural_fallback_covers_features(
             )
         })?;
     anyhow::ensure!(
-        binding.structural.length == features,
+        features_fit_reservation(binding.structural.length, features),
         "precomputed {modality} item {} covers {} prompt positions for {features} encoder features",
         binding.item_index,
         binding.structural.length
     );
     Ok(())
+}
+
+/// Whether `features` encoder outputs can land in `reserved` prompt positions.
+///
+/// Usually one feature takes one position. Some models pack a fixed number of
+/// encoder outputs into each embedding before placing it, so they reserve fewer
+/// positions than they carry features, by a whole factor. Anything that is not
+/// a whole factor is a genuine mismatch, which the engine answers by ending the
+/// process rather than the request.
+fn features_fit_reservation(reserved: usize, features: usize) -> bool {
+    reserved > 0 && features >= reserved && features.is_multiple_of(reserved)
 }
 
 fn placeholders_for_binding(
@@ -1495,6 +1506,39 @@ mod tests {
             .to_string();
         assert!(
             error.contains("reserves 3 prompt positions for 2"),
+            "{error}"
+        );
+    }
+
+    fn intermediate_with_features(
+        features: usize,
+        prompt_positions: usize,
+    ) -> PrecomputedMultimodalIntermediate {
+        let mut intermediate = one_video_intermediate(2, prompt_positions);
+        intermediate.preprocessed.feature_token_counts = vec![features];
+        intermediate
+    }
+
+    /// A model that packs several encoder outputs into each placed embedding
+    /// reserves fewer positions than it has features, and must still be sent.
+    /// The ratios here are the ones a 336px tile produces at the shuffle
+    /// settings a shipped vision model uses.
+    #[test]
+    fn a_prompt_that_packs_several_features_into_each_position_is_sent() {
+        for (features, reserved) in [(576, 144), (288, 144), (2, 2)] {
+            assert!(
+                validate_precomputed_batch(&intermediate_with_features(features, reserved)).is_ok(),
+                "{reserved} positions for {features} features"
+            );
+        }
+
+        // Part of a feature cannot be placed anywhere, so a count that does not
+        // divide is still the mismatch this guards against.
+        let error = validate_precomputed_batch(&intermediate_with_features(500, 144))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("reserves 144 prompt positions for 500"),
             "{error}"
         );
     }

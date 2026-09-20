@@ -95,17 +95,16 @@ impl GrpcRouter {
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
 
-        // Create multimodal components (best-effort; non-fatal if initialization fails)
-        let multimodal = match MultimodalComponents::new(
-            ctx.multimodal_config_registry.clone(),
-            ctx.router_config.mm_per_request_image_limit,
-        ) {
-            Ok(mc) => Some(Arc::new(mc)),
-            Err(e) => {
-                tracing::warn!("Multimodal components initialization failed (non-fatal): {e}");
-                None
-            }
-        };
+        // What can fail here is the operator's own setting, so the router
+        // stops rather than coming up with media handling quietly switched
+        // off and every media request failing later for no stated reason.
+        let multimodal = Some(Arc::new(
+            MultimodalComponents::new(
+                ctx.multimodal_config_registry.clone(),
+                ctx.router_config.mm_per_request_image_limit,
+            )
+            .map_err(|e| format!("multimodal components: {e:#}"))?,
+        ));
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {

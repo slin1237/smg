@@ -1485,4 +1485,12 @@ async fn test_m3_undeclared_tool_parses_without_a_tool_inventory() {
         .filter_map(|call| call.name.as_deref())
         .collect();
     assert_eq!(names, ["list_skills"]);
+    // The name arrives on its own and the arguments follow, so the pieces have
+    // to add back up to what the one-shot parse returned. Checking the name
+    // alone would also pass on a call that streamed no arguments at all.
+    let arguments: String = streamed
+        .iter()
+        .map(|call| call.parameters.as_str())
+        .collect();
+    assert_eq!(arguments, "{}");
 }

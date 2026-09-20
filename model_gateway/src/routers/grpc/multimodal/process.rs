@@ -74,7 +74,8 @@ pub(crate) async fn process_multimodal_plan(
 
     let media_started = Instant::now();
     let mut tracker = AsyncMultiModalTracker::new(components.media_connector.clone())
-        .with_default_video_sample_fps(spec.default_video_sample_fps());
+        .with_default_video_sample_fps(spec.default_video_sample_fps())
+        .with_video_frame_sampling(spec.video_frame_sampling());
 
     for part in plan.into_parts() {
         tracker

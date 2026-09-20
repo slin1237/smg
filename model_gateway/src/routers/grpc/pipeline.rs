@@ -495,7 +495,7 @@ impl RequestPipeline {
             dctx.workers.as_ref(),
         ));
 
-        execute_plan(dctx, attempt_plan).await?;
+        execute_plan(dctx, attempt_plan, last_attempt).await?;
         self.stages
             .response_processing
             .process(dctx, spec.clone())

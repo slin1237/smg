@@ -161,7 +161,8 @@ pub struct RouterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_shm_min_bytes: Option<usize>,
     /// Most bytes of preprocessed media the gateway holds in flight for engines
-    /// at once. Requests past it wait briefly, then get 429; unset leaves it
+    /// at once. A request that fits waits briefly for room, then gets 429; one
+    /// larger than the whole budget gets 413 straight away. Unset leaves it
     /// unbounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_max_inflight_bytes: Option<usize>,

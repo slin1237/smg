@@ -189,9 +189,14 @@ fn pd_leg_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 /// Dispatch one attempt of the retained plan: create the attempt's load
 /// guards, fan out encode jobs on the first EPD dispatch, and store the
 /// execution result on the context for response processing.
+///
+/// `last_attempt` says whether a plan is still retained for a replay, which
+/// is what decides when the media bytes stop counting against the in-flight
+/// budget.
 pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     execution_plan: ExecutionPlan,
+    last_attempt: bool,
 ) -> Result<(), Response> {
     // One bootstrap room per backend request the plan will post: a batched
     // completion fans out one PD dispatch per sub-request, so admission has
@@ -292,8 +297,12 @@ pub(crate) async fn execute_plan(
     }
     .instrument(span)
     .await;
-    // The engines hold the request bodies now.
-    ctx.multimodal_inflight.take();
+    // The engines hold the request bodies now. An earlier attempt keeps its
+    // share of the budget: the retained plan still owns the same media, and a
+    // replay would send it again.
+    if last_attempt {
+        ctx.multimodal_inflight.take();
+    }
     let result = result?;
 
     // Store result in context for response processing

@@ -503,7 +503,6 @@ struct Router {
     encode_policy: Option<PolicyType>,
     multimodal_tensor_transport: Option<String>,
     multimodal_shm_min_bytes: Option<usize>,
-    multimodal_max_inflight_bytes: Option<usize>,
     model_aliases: HashMap<String, String>,
     worker_startup_delay: u64,
     worker_ports_annotation: String,
@@ -535,6 +534,7 @@ struct Router {
     enable_rl: bool,
     rl_control_timeout_secs: u64,
     rl_fanout_concurrency: usize,
+    multimodal_max_inflight_bytes: Option<usize>,
 }
 
 impl Router {
@@ -1085,7 +1085,6 @@ impl Router {
         encode_policy = None,
         multimodal_tensor_transport = None,
         multimodal_shm_min_bytes = None,
-        multimodal_max_inflight_bytes = None,
         model_aliases = HashMap::new(),
         worker_startup_delay = 0,
         worker_ports_annotation = String::from("smg.ai/worker-ports"),
@@ -1120,6 +1119,7 @@ impl Router {
         enable_rl = false,
         rl_control_timeout_secs = 600,
         rl_fanout_concurrency = 32,
+        multimodal_max_inflight_bytes = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1246,7 +1246,6 @@ impl Router {
         encode_policy: Option<PolicyType>,
         multimodal_tensor_transport: Option<String>,
         multimodal_shm_min_bytes: Option<usize>,
-        multimodal_max_inflight_bytes: Option<usize>,
         model_aliases: HashMap<String, String>,
         worker_startup_delay: u64,
         worker_ports_annotation: String,
@@ -1280,6 +1279,7 @@ impl Router {
         enable_rl: bool,
         rl_control_timeout_secs: u64,
         rl_fanout_concurrency: usize,
+        multimodal_max_inflight_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1424,7 +1424,6 @@ impl Router {
             encode_policy,
             multimodal_tensor_transport,
             multimodal_shm_min_bytes,
-            multimodal_max_inflight_bytes,
             model_aliases,
             worker_startup_delay,
             worker_ports_annotation,
@@ -1452,6 +1451,7 @@ impl Router {
             enable_rl,
             rl_control_timeout_secs,
             rl_fanout_concurrency,
+            multimodal_max_inflight_bytes,
         })
     }
 

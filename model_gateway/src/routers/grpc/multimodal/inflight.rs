@@ -1,6 +1,12 @@
 //! Cap on the preprocessed media bytes the gateway holds in flight for engines.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use axum::response::Response;
 use http::StatusCode;
@@ -27,18 +33,24 @@ pub(crate) struct MultimodalInflight {
     budget_bytes: usize,
     units: usize,
     semaphore: Arc<Semaphore>,
+    /// What the requests currently queued for room are holding.
+    waiting: AtomicUsize,
     wait: Duration,
 }
 
 impl MultimodalInflight {
     pub(crate) fn new(budget_bytes: usize) -> Self {
-        let units = budget_bytes
-            .div_ceil(UNIT_BYTES)
-            .clamp(1, Semaphore::MAX_PERMITS);
+        // Rounded down, so a budget that is not a whole number of units is
+        // enforced at the nearest value below it rather than above. A budget
+        // under one unit therefore admits nothing, which is the honest
+        // reading of asking for less than the smallest amount that can be
+        // handed out.
+        let units = (budget_bytes / UNIT_BYTES).min(Semaphore::MAX_PERMITS);
         Self {
-            budget_bytes,
+            budget_bytes: units * UNIT_BYTES,
             units,
             semaphore: Arc::new(Semaphore::new(units)),
+            waiting: AtomicUsize::new(0),
             wait: WAIT,
         }
     }
@@ -59,14 +71,50 @@ impl MultimodalInflight {
         if units > self.units {
             return Err(InflightRefusal::TooLarge);
         }
-        let Ok(units) = u32::try_from(units) else {
+        let Ok(permit_units) = u32::try_from(units) else {
             return Err(InflightRefusal::TooLarge);
         };
-        let acquire = Arc::clone(&self.semaphore).acquire_many_owned(units);
+        // A request keeps its media while it queues, so the queue weighs as
+        // much as the budget does. Turning arrivals away past one budget's
+        // worth of queue keeps what the gateway holds bounded, instead of
+        // letting it grow with however many callers happen to be waiting.
+        let queued = Waiting::enter(&self.waiting, units);
+        if queued.total() > self.units {
+            return Err(InflightRefusal::Busy);
+        }
+        let acquire = Arc::clone(&self.semaphore).acquire_many_owned(permit_units);
         match tokio::time::timeout(self.wait, acquire).await {
             Ok(Ok(permit)) => Ok(InflightPermit { _permit: permit }),
             Ok(Err(_)) | Err(_) => Err(InflightRefusal::Busy),
         }
+    }
+}
+
+/// One queued request's share of the waiting total, given back on drop.
+struct Waiting<'a> {
+    waiting: &'a AtomicUsize,
+    units: usize,
+    total: usize,
+}
+
+impl<'a> Waiting<'a> {
+    fn enter(waiting: &'a AtomicUsize, units: usize) -> Self {
+        let total = waiting.fetch_add(units, Ordering::AcqRel) + units;
+        Self {
+            waiting,
+            units,
+            total,
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.total
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.waiting.fetch_sub(self.units, Ordering::AcqRel);
     }
 }
 
@@ -137,6 +185,56 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_millis(15));
         assert!(inflight.reserve(0).await.is_ok());
+    }
+
+    /// A budget that is not a whole number of units is enforced at the value
+    /// below it, so the gateway never admits more than it was told to.
+    #[tokio::test]
+    async fn a_budget_between_units_is_rounded_down() {
+        let inflight = quick(4097);
+        assert_eq!(inflight.budget_bytes(), 4096);
+        assert_eq!(
+            inflight.reserve(5000).await.unwrap_err(),
+            InflightRefusal::TooLarge
+        );
+
+        let under_one_unit = quick(1);
+        assert_eq!(under_one_unit.budget_bytes(), 0);
+        assert_eq!(
+            under_one_unit.reserve(1).await.unwrap_err(),
+            InflightRefusal::TooLarge
+        );
+        assert!(under_one_unit.reserve(0).await.is_ok());
+    }
+
+    /// Queued requests still hold their media, so the gateway turns arrivals
+    /// away once the queue is as heavy as the budget rather than letting the
+    /// two of them add up without limit.
+    #[tokio::test]
+    async fn arrivals_past_a_budget_of_waiting_are_refused_without_waiting() {
+        let inflight = Arc::new(MultimodalInflight::new(4096).with_wait(Duration::from_secs(5)));
+        let held = inflight.reserve(4096).await.unwrap();
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test joins this handle before it returns"
+        )]
+        let queued = tokio::spawn({
+            let inflight = Arc::clone(&inflight);
+            async move { inflight.reserve(4096).await }
+        });
+        // Give the queued request time to register before the next arrives.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            inflight.reserve(1024).await.unwrap_err(),
+            InflightRefusal::Busy
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        drop(held);
+        assert!(queued.await.unwrap().is_ok());
     }
 
     #[tokio::test]

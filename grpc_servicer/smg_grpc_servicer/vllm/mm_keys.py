@@ -26,6 +26,34 @@ def mm_batches(request) -> list:
     return batches
 
 
+def describes_media_twice(request) -> bool:
+    """Whether a request brings both media references and batches of its own.
+
+    Only one of the two is ever read, so the other would be dropped without a
+    word. A request asking for both has not said what it wants.
+    """
+    return request.HasField("media_refs") and bool(mm_batches(request))
+
+
+def batches_missing_pixels(batches) -> list:
+    """The batches carrying no encoder tensor of their own.
+
+    Each modality is encoded from its own batch, so one batch standing in for
+    another is not enough: whichever batch is listed here would leave its
+    encoder with nothing to read.
+    """
+    return [batch for batch in batches if not batch.HasField("pixel_values")]
+
+
+def mm_identity_hashes(batches) -> list:
+    """Every batch's media hashes, in order.
+
+    These name the media a request carries. Leaving a batch's hashes out would
+    let two requests differing only in that batch's media read as the same one.
+    """
+    return [mm_hash for batch in batches for mm_hash in batch.mm_hashes]
+
+
 def modality_name(mm_proto) -> str:
     """vLLM's name for the batch's modality: ``video`` or ``image``."""
     return "video" if mm_proto.modality == common_pb2.VIDEO else "image"

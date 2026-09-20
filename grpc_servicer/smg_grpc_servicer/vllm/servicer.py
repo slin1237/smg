@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import itertools
 import json
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from datetime import datetime, timezone
@@ -55,14 +56,25 @@ from smg_grpc_servicer.vllm.kv_transfer import (
 )
 from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
+    DEFAULT_MAX_INFLIGHT,
+    ENV_MAX_INFLIGHT,
     ENV_PROCESSOR,
     MmProcessorUnavailable,
     build_mm_processor,
+    env_int,
 )
 from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, mm_identity_cache_salt
 
 from ..pd_pairing import pairing_protocol_from_env
-from .mm_keys import mm_batches, modality_key, modality_name, primary_encoder_key
+from .mm_keys import (
+    batches_missing_pixels,
+    describes_media_twice,
+    mm_batches,
+    mm_identity_hashes,
+    modality_key,
+    modality_name,
+    primary_encoder_key,
+)
 
 logger = init_logger(__name__)
 attach_vllm_logging()
@@ -172,15 +184,40 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         self._kv_events_config = resolve_kv_events_config(async_llm)
         # Worker-side media processing (media_refs); None keeps refs rejected.
         self._mm_processor = build_mm_processor(async_llm)
-        self._mm_inflight = (
-            asyncio.Semaphore(self._mm_processor.max_inflight)
+        # One cap over all the multimodal work this servicer runs off the event
+        # loop, whether it fetches the media itself or converts tensors the
+        # router already prepared. Both are sized by the same setting, so a
+        # worker's memory ceiling does not depend on which path a request takes.
+        self._mm_inflight = asyncio.Semaphore(
+            self._mm_processor.max_inflight
             if self._mm_processor is not None
-            else None
+            else env_int(os.environ, ENV_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT)
         )
         logger.info(
             "VllmEngineServicer initialized (mm_processor=%s)",
             self._mm_processor.name if self._mm_processor is not None else "off",
         )
+
+    async def _off_the_event_loop(self, work, *args):
+        """Run one piece of blocking multimodal work under the in-flight cap.
+
+        A worker thread cannot be interrupted, so the slot is handed back when
+        the thread itself finishes rather than when the caller stops waiting.
+        A caller that goes away while the work is still running therefore does
+        not let the next one start against memory that is still held.
+        """
+        await self._mm_inflight.acquire()
+        running = asyncio.ensure_future(asyncio.to_thread(work, *args))
+
+        def finished(done: asyncio.Future) -> None:
+            self._mm_inflight.release()
+            if not done.cancelled():
+                # Nobody may be left to read a failure; take it here so the
+                # loop does not report it as never retrieved.
+                done.exception()
+
+        running.add_done_callback(finished)
+        return await asyncio.shield(running)
 
     async def Generate(
         self,
@@ -231,10 +268,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             if request.HasField("media_refs"):
                 # Media references from the router: the worker fetches and runs
                 # vLLM's own processor over the unexpanded placeholder anchors.
-                if input_type != "tokenized" or request.HasField("mm_inputs"):
+                if input_type != "tokenized" or describes_media_twice(request):
                     raise ValueError(
-                        "media_refs requires tokenized input and is mutually exclusive "
-                        "with mm_inputs"
+                        "media_refs requires tokenized input and cannot be combined with "
+                        "preprocessed multimodal inputs"
                     )
                 if self._mm_processor is None:
                     raise ValueError(
@@ -255,8 +292,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 # A pixel-less payload (PD decode leg) is only decodable with
                 # remote KV: a local recompute would schedule the vision
                 # encoder with no pixels and crash the engine.
-                has_pixels = any(batch.HasField("pixel_values") for batch in preprocessed_batches)
-                if not has_pixels and kv_transfer_params is None:
+                # Every batch needs its own, not just one of them: a batch left
+                # out contributes no encoder tensor, and the engine would run
+                # that modality's encoder with nothing to encode.
+                if batches_missing_pixels(preprocessed_batches) and kv_transfer_params is None:
                     logger.warning(
                         "Request %s: pixel-less multimodal payload with no kv_transfer_params; "
                         "rejecting (prefill worker did not hand off KV?)",
@@ -272,7 +311,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 # copies and dtype casts scale with the payload (hundreds of
                 # megabytes for a many-image request), so they run off the
                 # event loop and health checks keep being answered meanwhile.
-                prompt = await asyncio.to_thread(
+                prompt = await self._off_the_event_loop(
                     self._build_preprocessed_mm_inputs, request.tokenized, preprocessed_batches
                 )
                 prompt["arrival_time"] = arrival_time
@@ -283,9 +322,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 # Tensor-less mm payload (grid-less PD decode leg): fold the
                 # kept mm hashes into cache_salt so different images cannot
                 # alias. Grid-carrying legs took the preprocessed path above.
-                if request.HasField("mm_inputs"):
-                    all_hashes = [h for batch in mm_batches(request) for h in batch.mm_hashes]
-                    cache_salt = mm_identity_cache_salt(all_hashes)
+                batches = mm_batches(request)
+                if batches:
+                    cache_salt = mm_identity_cache_salt(mm_identity_hashes(batches))
                     if cache_salt is not None:
                         prompt["cache_salt"] = cache_salt
                     model_config = getattr(self.engine, "model_config", None)

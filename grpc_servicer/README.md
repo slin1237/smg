@@ -62,8 +62,10 @@ On the router side, `SMG_MM_PROCESSING` selects `auto` (default: forward when
 the model's spec opts in and every registered worker of the model advertises
 `mm_processor`), `router` (always preprocess) or `worker` (strict: 400 when a
 request cannot be forwarded); the outcome is counted in
-`smg_mm_processing_total{model,mode,reason}`. On the worker path the router
-never expands placeholders, so routing decisions that weigh the prompt's token
+`smg_mm_processing_total{model,mode,reason}`. It is read from the router's
+environment only and has no router-config equivalent. Any other value stops the
+router at startup instead of quietly reverting to `auto`. On the worker path the
+router never expands placeholders, so routing decisions that weigh the prompt's token
 count (cache-aware policies, load estimates) see one token per media item where
 the worker will schedule the full placeholder run. The `E2E_MM_PROCESSING=worker`
 e2e lanes run the multimodal suites in this mode, and

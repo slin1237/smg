@@ -258,15 +258,21 @@ pub(crate) struct MultimodalComponents {
 }
 
 /// Router-wide multimodal processing mode from `SMG_MM_PROCESSING` (default `auto`).
-fn mm_processing_from_env() -> MmProcessingMode {
-    match std::env::var("SMG_MM_PROCESSING") {
-        Ok(value) if !value.trim().is_empty() => {
-            MmProcessingMode::parse(&value).unwrap_or_else(|| {
-                warn!(%value, "invalid SMG_MM_PROCESSING; using auto");
-                MmProcessingMode::Auto
-            })
-        }
-        _ => MmProcessingMode::Auto,
+///
+/// A value that cannot be read stops startup. Carrying on with the default
+/// would leave the router doing the opposite of what the operator asked for,
+/// and a warning in the startup log is easy to miss.
+fn mm_processing_from_env() -> Result<MmProcessingMode> {
+    mm_processing_from_value(std::env::var("SMG_MM_PROCESSING").ok().as_deref())
+}
+
+fn mm_processing_from_value(value: Option<&str>) -> Result<MmProcessingMode> {
+    match value {
+        Some(value) if !value.trim().is_empty() => value
+            .parse::<MmProcessingMode>()
+            .map_err(|message| anyhow::anyhow!("{message}"))
+            .context("SMG_MM_PROCESSING"),
+        _ => Ok(MmProcessingMode::Auto),
     }
 }
 
@@ -284,7 +290,7 @@ impl MultimodalComponents {
         let media_connector = MediaConnector::new(client, MediaConnectorConfig::default())
             .context("Failed to create MediaConnector")?;
 
-        let processing = mm_processing_from_env();
+        let processing = mm_processing_from_env()?;
         tracing::info!(mode = %processing, "multimodal processing mode");
 
         Ok(Self {
@@ -466,5 +472,28 @@ mod tests {
             .await
             .expect("preloaded entry must be returned without touching source");
         assert!(Arc::ptr_eq(&got, &cfg));
+    }
+
+    /// A mode that is nearly right would otherwise resolve to the default and
+    /// run the opposite of what the operator asked for.
+    #[test]
+    fn an_unreadable_processing_mode_stops_startup() {
+        assert_eq!(
+            mm_processing_from_value(Some("worker")).unwrap(),
+            MmProcessingMode::Worker
+        );
+        assert_eq!(
+            mm_processing_from_value(Some(" Router ")).unwrap(),
+            MmProcessingMode::Router
+        );
+        assert_eq!(
+            mm_processing_from_value(None).unwrap(),
+            MmProcessingMode::Auto
+        );
+        assert_eq!(
+            mm_processing_from_value(Some("  ")).unwrap(),
+            MmProcessingMode::Auto
+        );
+        assert!(mm_processing_from_value(Some("routers")).is_err());
     }
 }

@@ -7,7 +7,6 @@ use std::collections::HashSet;
 use llm_multimodal::{media, MediaContentPart, Modality};
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
-use tracing::{debug, warn};
 
 use super::{
     capability::runtime_supports_modality,
@@ -203,39 +202,11 @@ pub(crate) fn resolve_mm_processing(
         }
     };
 
+    // Where a model's media is processed is worker configuration, reported in
+    // the worker's labels and countable on this metric. It is not a per-request
+    // event, so it is not logged as one.
     Metrics::record_mm_processing(model_id, resolved.as_str(), reason);
-    log_transition(components, model_id, resolved, reason);
     Ok(resolved)
-}
-
-/// Warn once per (model, resolution) change so a fleet silently staying on
-/// the router path is visible; bounded by the number of served models.
-fn log_transition(
-    components: &MultimodalComponents,
-    model_id: &str,
-    resolved: MmProcessing,
-    reason: &'static str,
-) {
-    let Ok(mut log) = components.mm_mode_log.lock() else {
-        return;
-    };
-    let previous = log.insert(model_id.to_string(), (resolved, reason));
-    if previous == Some((resolved, reason)) {
-        return;
-    }
-    match resolved {
-        MmProcessing::Worker => debug!(
-            model = %model_id,
-            reason,
-            "multimodal media is forwarded to workers for processing"
-        ),
-        MmProcessing::Router if reason == "config" => {}
-        MmProcessing::Router => warn!(
-            model = %model_id,
-            reason,
-            "multimodal media stays on the router path"
-        ),
-    }
 }
 
 /// Post-selection check: every leg must accept references, and every URL

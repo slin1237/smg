@@ -1,11 +1,7 @@
 //! Multimodal model configuration: the shared config-file registry and the
 //! per-router component bundle (media connector + processor/model registries).
 
-use std::{
-    collections::HashMap,
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -19,7 +15,6 @@ use tracing::{debug, warn};
 use super::{
     inflight::MultimodalInflight,
     pixel_cache::{pixel_cache_from_env, PixelCache},
-    refs::MmProcessing,
 };
 
 /// Cached model configuration files loaded from the tokenizer directory.
@@ -254,8 +249,6 @@ pub(crate) struct MultimodalComponents {
     pub modality_limit_overrides: HashMap<Modality, usize>,
     /// Where media is fetched and preprocessed for vLLM gRPC workers.
     pub processing: MmProcessingMode,
-    /// Last resolved (location, reason) per model, to warn once per change.
-    pub mm_mode_log: Mutex<HashMap<String, (MmProcessing, &'static str)>>,
     /// Cap on preprocessed media bytes in flight; `None` leaves it unbounded.
     pub inflight: Option<Arc<MultimodalInflight>>,
 }
@@ -323,7 +316,6 @@ impl MultimodalComponents {
                 .map(|limit| HashMap::from([(Modality::Image, limit)]))
                 .unwrap_or_default(),
             processing,
-            mm_mode_log: Mutex::new(HashMap::new()),
             inflight,
         })
     }

@@ -619,6 +619,39 @@ fn validate_precomputed_batch(intermediate: &PrecomputedMultimodalIntermediate) 
         "precomputed multimodal binding count mismatch: modality={modality}, binding_count={binding_count}, media_count={media_count}"
     );
 
+    let encoder_rows = intermediate
+        .preprocessed
+        .encoder_input
+        .shape()
+        .first()
+        .copied()
+        .unwrap_or_default();
+    match &intermediate.field_layouts.encoder_input {
+        FieldLayout::Batched => anyhow::ensure!(
+            encoder_rows == media_count,
+            "precomputed {modality} batch carries {encoder_rows} encoder rows for {media_count} media items"
+        ),
+        FieldLayout::Flat { sizes_key } => {
+            let sizes = tensor_sizes_from_model_specific(
+                &intermediate.preprocessed.model_specific,
+                sizes_key,
+            )?;
+            anyhow::ensure!(
+                sizes.len() == media_count,
+                "precomputed {modality} batch declares {} item sizes for {media_count} media items",
+                sizes.len()
+            );
+            let covered = sizes
+                .iter()
+                .try_fold(0usize, |acc, &size| acc.checked_add(size))
+                .context("flat encoder size total overflow")?;
+            anyhow::ensure!(
+                covered == encoder_rows,
+                "precomputed {modality} item sizes cover {covered} of {encoder_rows} encoder rows"
+            );
+        }
+    }
+
     let mut item_indices = HashSet::with_capacity(binding_count);
     for binding in &intermediate.bindings {
         anyhow::ensure!(
@@ -641,6 +674,7 @@ fn validate_precomputed_batch(intermediate: &PrecomputedMultimodalIntermediate) 
             .offset
             .checked_add(binding.structural.length)
             .context("structural prompt range overflow")?;
+        let mut reserved = 0usize;
         for patch in &binding.patches {
             let patch_end = patch
                 .offset
@@ -655,6 +689,26 @@ fn validate_precomputed_batch(intermediate: &PrecomputedMultimodalIntermediate) 
                 patch.length,
                 binding.structural.offset,
                 binding.structural.length
+            );
+            reserved = reserved
+                .checked_add(patch.length)
+                .context("patch prompt length overflow")?;
+        }
+        if !binding.patches.is_empty() {
+            let features = *intermediate
+                .preprocessed
+                .feature_token_counts
+                .get(binding.item_index)
+                .with_context(|| {
+                    format!(
+                        "missing {modality} feature count for item {}",
+                        binding.item_index
+                    )
+                })?;
+            anyhow::ensure!(
+                reserved == features,
+                "precomputed {modality} item {} reserves {reserved} prompt positions for {features} encoder features",
+                binding.item_index
             );
         }
     }
@@ -1258,6 +1312,76 @@ mod tests {
             second.model_specific_tensors["video_grid_thw"].shape,
             vec![1, 3]
         );
+    }
+
+    /// One clip, two encoder rows, sized and bound however the caller asks.
+    fn one_video_intermediate(
+        item_size: u32,
+        prompt_positions: usize,
+    ) -> PrecomputedMultimodalIntermediate {
+        let model_specific = HashMap::from([(
+            "patches_per_video".to_string(),
+            ModelSpecificValue::UintTensor {
+                data: vec![item_size],
+                shape: vec![1],
+            },
+        )]);
+
+        PrecomputedMultimodalIntermediate {
+            preprocessed: PreprocessedEncoderInputs {
+                encoder_input: ArrayD::from_shape_vec(IxDyn(&[2, 2]), vec![1.0, 2.0, 3.0, 4.0])
+                    .unwrap(),
+                feature_token_counts: vec![2],
+                item_sizes: vec![(1, 1)],
+                model_specific,
+            },
+            media: MediaBatch::Videos(vec![Arc::new(VideoClip::new(
+                vec![image::DynamicImage::new_rgb8(1, 1)],
+                bytes::Bytes::from_static(b"a"),
+                llm_multimodal::VideoSource::InlineBytes,
+                "video-hash-a".to_string(),
+            ))]),
+            bindings: vec![PromptBinding {
+                item_index: 0,
+                prompt_ordinal: 0,
+                structural: PlaceholderRange {
+                    offset: 30,
+                    length: prompt_positions,
+                },
+                patches: vec![PlaceholderRange {
+                    offset: 30,
+                    length: prompt_positions,
+                }],
+            }],
+            placeholder_token_id: Some(151656),
+            field_layouts: EncoderFieldLayouts::new(
+                FieldLayout::flat("patches_per_video"),
+                HashMap::from([("patches_per_video".to_string(), FieldLayout::Batched)]),
+            ),
+            keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
+        }
+    }
+
+    #[test]
+    fn a_prompt_that_reserves_more_room_than_the_media_fills_is_refused() {
+        assert!(validate_precomputed_batch(&one_video_intermediate(2, 2)).is_ok());
+
+        let error = validate_precomputed_batch(&one_video_intermediate(2, 3))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("reserves 3 prompt positions for 2"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn media_the_engine_would_not_read_in_full_is_refused() {
+        let error = validate_precomputed_batch(&one_video_intermediate(1, 2))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cover 1 of 2 encoder rows"), "{error}");
     }
 
     #[test]

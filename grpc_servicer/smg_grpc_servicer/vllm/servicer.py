@@ -64,6 +64,7 @@ from smg_grpc_servicer.vllm.mm_processor import (
     env_int,
 )
 from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, mm_identity_cache_salt
+from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
 
 from ..pd_pairing import pairing_protocol_from_env
 from .mm_keys import (
@@ -95,23 +96,6 @@ def _filtered_sampling_defaults(params: dict | None) -> dict:
         for key in SAMPLING_DEFAULT_KEYS
         if key in params and params[key] is not None
     }
-
-
-# Proto dtype string → torch dtype
-_PROTO_DTYPE_MAP: dict[str, torch.dtype] = {
-    "float32": torch.float32,
-    "int64": torch.int64,
-    "uint32": torch.uint32,
-}
-
-
-def _tensor_from_proto(td: vllm_engine_pb2.TensorData) -> torch.Tensor:
-    """Deserialize a TensorData proto message into a torch.Tensor."""
-    torch_dtype = _PROTO_DTYPE_MAP.get(td.dtype)
-    if torch_dtype is None:
-        raise ValueError(f"Unsupported proto tensor dtype: {td.dtype!r}")
-    payload = mm_shm.tensor_payload_bytes(td)
-    return torch.frombuffer(bytearray(payload), dtype=torch_dtype).reshape(*td.shape)
 
 
 try:
@@ -823,9 +807,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             batch: dict[str, torch.Tensor] = {}
             if mm_proto.HasField("pixel_values"):
                 primary_key = mm_key(primary_encoder_key(mm_proto))
-                batch[primary_key] = _tensor_from_proto(mm_proto.pixel_values)
+                batch[primary_key] = tensor_from_proto(mm_proto.pixel_values)
             for key, td in mm_proto.model_specific_tensors.items():
-                batch[mm_key(key)] = _tensor_from_proto(td)
+                batch[mm_key(key)] = tensor_from_proto(td)
             for key, tensor in batch.items():
                 if tensor.is_floating_point():
                     batch[key] = tensor.to(dtype=model_dtype)

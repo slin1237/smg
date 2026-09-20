@@ -1,7 +1,7 @@
 """vLLM gRPC servicers -- VllmEngine proto service and standard health check.
 
 The servicer classes import vLLM and load on first attribute access, so the
-engine-free submodules (media_refs, mm_processor) import without it.
+engine-free submodules (media_refs, mm_processor, mm_tensors) import without it.
 """
 
 import logging

@@ -930,7 +930,8 @@ class RouterArgs:
                 "Most bytes of preprocessed media held in flight for engines at"
                 " once; a request that fits waits briefly for room, then gets"
                 " 429, and one larger than the whole budget gets 413 straight"
-                " away"
+                " away. A waiting request still holds its media, so size memory"
+                " for about twice this value. Zero is refused, not read as unset"
             ),
         )
         parser.add_argument(

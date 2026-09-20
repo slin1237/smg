@@ -600,7 +600,10 @@ struct CliArgs {
     multimodal_shm_min_bytes: Option<usize>,
 
     /// Most bytes of preprocessed media the gateway holds in flight for engines
-    /// at once; requests past it wait briefly, then get 429. Unset: unbounded.
+    /// at once; a request that fits waits briefly, then gets 429, and one
+    /// larger than the whole budget gets 413 straight away. A waiting request
+    /// still holds its media, so size memory for about twice this value.
+    /// Unset: unbounded. Zero is refused rather than read as unset.
     #[arg(long, help_heading = "Multimodal")]
     multimodal_max_inflight_bytes: Option<usize>,
 

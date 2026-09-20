@@ -162,8 +162,10 @@ pub struct RouterConfig {
     pub multimodal_shm_min_bytes: Option<usize>,
     /// Most bytes of preprocessed media the gateway holds in flight for engines
     /// at once. A request that fits waits briefly for room, then gets 429; one
-    /// larger than the whole budget gets 413 straight away. Unset leaves it
-    /// unbounded.
+    /// larger than the whole budget gets 413 straight away. A request waiting
+    /// for room still holds its media, and the queue is capped at one budget
+    /// as well, so size memory for about twice this value. Unset leaves it
+    /// unbounded; zero is refused rather than read as unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_max_inflight_bytes: Option<usize>,
     /// Per-request image-count limit applied to every model, replacing each

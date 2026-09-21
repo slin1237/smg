@@ -77,16 +77,35 @@ class TestItemBytes:
 
 
 class TestItemCount:
+    class _MmConfig:
+        def __init__(self, limits):
+            self._limits = limits
+
+        def get_limit_per_prompt(self, modality):
+            return self._limits[modality]
+
     def test_within_cap_passes(self):
         items = [_Item("image", f"https://a/{i}.png") for i in range(3)]
-        mm_processor.enforce_item_count(items, 3)
+        mm_processor.enforce_item_count(items, {"image": 3, "video": 1})
 
     def test_over_cap_is_rejected(self):
         items = [_Item("image", f"https://a/{i}.png") for i in range(4)]
-        with pytest.raises(
-            ValueError, match="4 items, above the 3-item cap \\(SMG_VLLM_MM_MAX_ITEMS\\)"
-        ):
-            mm_processor.enforce_item_count(items, 3)
+        with pytest.raises(ValueError, match="4 image items, above this worker's limit of 3"):
+            mm_processor.enforce_item_count(items, {"image": 3, "video": 1})
+
+    def test_each_kind_is_counted_on_its_own(self):
+        items = [_Item("image", "https://a/1.png"), _Item("video", "https://a/1.mp4")]
+        mm_processor.enforce_item_count(items, {"image": 1, "video": 1})
+        with pytest.raises(ValueError, match="1 video items, above this worker's limit of 0"):
+            mm_processor.enforce_item_count(items, {"image": 1, "video": 0})
+
+    def test_limits_follow_the_engine_by_default(self):
+        cfg = self._MmConfig({"image": 200, "video": 4})
+        assert mm_processor.item_limits(cfg) == {"image": 200, "video": 4}
+
+    def test_override_applies_to_every_kind(self):
+        cfg = self._MmConfig({"image": 200, "video": 4})
+        assert mm_processor.item_limits(cfg, 2) == {"image": 2, "video": 2}
 
 
 class TestBuildProcessor:
@@ -178,6 +197,9 @@ class TestFetchAll:
 
 
 class TestFetchErrorClassification:
+    class _CallerError(Exception):
+        """Stands in for vLLM's own "the caller sent something unusable" error."""
+
     class _Connector:
         def __init__(self, exc):
             self.exc = exc
@@ -189,14 +211,21 @@ class TestFetchErrorClassification:
         p = mm_processor.InProcessMediaProcessor.__new__(mm_processor.InProcessMediaProcessor)
         p._connector = self._Connector(exc)
         p._video_processor = None
+        p._caller_error = self._CallerError
         return p
 
-    def test_transport_failures_become_client_errors(self):
+    def test_transport_failures_are_retryable(self):
         p = self.processor(TimeoutError("image fetch timed out"))
         with pytest.raises(
-            ValueError, match="media_refs\\[3\\]: fetch failed: image fetch timed out"
+            mm_processor.MmProcessorUnavailable,
+            match="media_refs\\[3\\]: fetch failed: image fetch timed out",
         ):
             run(p._fetch(3, _Item("image", "https://a/1.png")))
+
+    def test_caller_errors_pass_through(self):
+        p = self.processor(self._CallerError("415 Unsupported Media Type"))
+        with pytest.raises(self._CallerError, match="^415 Unsupported Media Type$"):
+            run(p._fetch(0, _Item("image", "https://a/1.png")))
 
     def test_value_errors_pass_through(self):
         p = self.processor(ValueError("domain not allowed"))
@@ -213,12 +242,18 @@ class TestProcess:
     """The engine-free half of process(): caps run before any fetch, and vLLM's
     placeholder validation error is the client's."""
 
+    class _CallerError(Exception):
+        """Stands in for vLLM's own "the caller sent something unusable" error."""
+
     class _Connector:
-        def __init__(self):
+        def __init__(self, exc=None):
             self.fetched: list[str] = []
+            self.exc = exc
 
         async def fetch_image_async(self, url):
             self.fetched.append(url)
+            if self.exc is not None:
+                raise self.exc
             return object()
 
     class _Renderer:
@@ -232,21 +267,32 @@ class TestProcess:
                 raise self.exc
             return {"prompt": prompt, "skip_mm_cache": skip_mm_cache}
 
-    def processor(self, renderer, *, max_items=16):
+    def processor(self, renderer, *, max_items=16, fetch_exc=None):
         p = mm_processor.InProcessMediaProcessor.__new__(mm_processor.InProcessMediaProcessor)
         p._engine = type("E", (), {"renderer": renderer})()
-        p._connector = self._Connector()
+        p._connector = self._Connector(fetch_exc)
         p._video_processor = None
         p._max_item_bytes = mm_processor.DEFAULT_MAX_ITEM_BYTES
-        p._max_items = max_items
+        p._item_limits = dict.fromkeys(("image", "video"), max_items)
+        p._caller_error = self._CallerError
         return p
 
     def test_item_cap_rejects_before_any_fetch(self):
         p = self.processor(self._Renderer(), max_items=1)
         items = [_Item("image", "https://a/1.png"), _Item("image", "https://a/2.png")]
-        with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEMS"):
+        with pytest.raises(ValueError, match="2 image items, above this worker's limit of 1"):
             run(p.process([1, 2, 3], None, items, 0.0))
         assert p._connector.fetched == []
+
+    def test_unusable_media_stays_the_callers_fault(self):
+        p = self.processor(self._Renderer(), fetch_exc=self._CallerError("not an image"))
+        with pytest.raises(self._CallerError):
+            run(p.process([1, 2, 3], None, [_Item("image", "https://a/1.png")], 0.0))
+
+    def test_transient_fetch_failure_is_retryable(self):
+        p = self.processor(self._Renderer(), fetch_exc=TimeoutError("origin timed out"))
+        with pytest.raises(mm_processor.MmProcessorUnavailable, match="fetch failed"):
+            run(p.process([1, 2, 3], None, [_Item("image", "https://a/1.png")], 0.0))
 
     def test_fetched_media_reaches_the_renderer_uncached(self):
         renderer = self._Renderer()

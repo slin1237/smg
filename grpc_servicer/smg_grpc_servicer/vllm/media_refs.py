@@ -15,6 +15,8 @@ _MODALITY_NAMES: dict[int, str] = {
     common_pb2.VIDEO: "video",
 }
 
+FETCHABLE_MODALITIES = tuple(_MODALITY_NAMES.values())
+
 BASE_SCHEMES = ("http", "https", "data")
 
 

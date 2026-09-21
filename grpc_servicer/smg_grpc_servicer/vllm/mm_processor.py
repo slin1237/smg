@@ -42,6 +42,7 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
 )
 from smg_grpc_servicer.vllm.media_refs import (
     BASE_SCHEMES,
+    FETCHABLE_MODALITIES,
     advertised_schemes,
     parse_scheme_list,
 )
@@ -60,7 +61,9 @@ VALID_MODES = (MODE_OFF, MODE_INPROCESS, MODE_REDIS)
 
 DEFAULT_MAX_INFLIGHT = 64
 DEFAULT_MAX_ITEM_BYTES = 32 * 1024 * 1024
-DEFAULT_MAX_ITEMS = 16
+# How long a bookkeeping round trip to the sidecar's Redis may take before the
+# worker calls it unreachable instead of waiting on it.
+CONTROL_TIMEOUT_S = 1.0
 # First vLLM release with renderer.process_for_engine_async(skip_mm_cache=).
 MIN_VLLM_VERSION = "0.20.0"
 
@@ -89,6 +92,14 @@ def env_int(env: Mapping[str, str], key: str, default: int) -> int:
     return value
 
 
+def env_int_opt(env: Mapping[str, str], key: str) -> int | None:
+    """Same as `env_int`, but an unset variable means "no override"."""
+    raw = env.get(key)
+    if raw is None or not raw.strip():
+        return None
+    return env_int(env, key, 0)
+
+
 def data_url_payload_bytes(url: str) -> int | None:
     """Approximate decoded byte size of a data: URL; None for other URLs."""
     if not url[:5].lower() == "data:":
@@ -109,12 +120,30 @@ def enforce_item_bytes(items: Sequence[Any], max_bytes: int) -> None:
             )
 
 
-def enforce_item_count(items: Sequence[Any], max_items: int) -> None:
+def item_limits(mm_config, override: int | None = None) -> dict[str, int]:
+    """How many items of each kind one request may carry.
+
+    The engine refuses a prompt that exceeds its own per-prompt limits, so the
+    same numbers bound the fetch: a worker never turns away what it was
+    configured to accept, and never fetches media the engine will not take.
+    """
+    if override is not None:
+        return dict.fromkeys(FETCHABLE_MODALITIES, override)
+    return {modality: mm_config.get_limit_per_prompt(modality) for modality in FETCHABLE_MODALITIES}
+
+
+def enforce_item_count(items: Sequence[Any], limits: Mapping[str, int]) -> None:
     """Bound per-request fetch fan-out before any fetch task is created."""
-    if len(items) > max_items:
-        raise ValueError(
-            f"media_refs carries {len(items)} items, above the {max_items}-item cap ({ENV_MAX_ITEMS})"
-        )
+    counts: dict[str, int] = {}
+    for item in items:
+        counts[item.modality] = counts.get(item.modality, 0) + 1
+    for modality, count in sorted(counts.items()):
+        limit = limits.get(modality, 0)
+        if count > limit:
+            raise ValueError(
+                f"media_refs carries {count} {modality} items, above this worker's "
+                f"limit of {limit} (--limit-mm-per-prompt, or {ENV_MAX_ITEMS} to override)"
+            )
 
 
 async def _fetch_all(coros: Sequence[Awaitable[Any]]) -> list[Any]:
@@ -162,10 +191,11 @@ class InProcessMediaProcessor:
         *,
         max_item_bytes: int = DEFAULT_MAX_ITEM_BYTES,
         max_inflight: int = DEFAULT_MAX_INFLIGHT,
-        max_items: int = DEFAULT_MAX_ITEMS,
+        max_items: int | None = None,
     ) -> None:
         _require_inprocess_apis(engine)
         from vllm import envs
+        from vllm.exceptions import VLLMClientError
         from vllm.multimodal.media.connector import MEDIA_CONNECTOR_REGISTRY
         from vllm.transformers_utils.processor import get_video_processor_cls_name
 
@@ -173,8 +203,10 @@ class InProcessMediaProcessor:
         mm_config = model_config.get_multimodal_config()
         self._engine = engine
         self._max_item_bytes = max_item_bytes
-        self._max_items = max_items
+        self._item_limits = item_limits(mm_config, max_items)
         self.max_inflight = max_inflight
+        # The fetcher already decides which failures are the caller's.
+        self._caller_error = VLLMClientError
         # Same construction as vLLM's OpenAI frontend, so the engine-level
         # allowlists and media_io_kwargs apply to refs fetched here.
         self._connector = MEDIA_CONNECTOR_REGISTRY.load(
@@ -205,7 +237,7 @@ class InProcessMediaProcessor:
         *,
         request_id: str = "",
     ):
-        enforce_item_count(items, self._max_items)
+        enforce_item_count(items, self._item_limits)
         enforce_item_bytes(items, self._max_item_bytes)
         fetched = await _fetch_all([self._fetch(index, item) for index, item in enumerate(items)])
         multi_modal_data: dict[str, list[Any]] = {}
@@ -230,7 +262,12 @@ class InProcessMediaProcessor:
             raise ValueError(f"multimodal placeholder validation failed: {e}") from e
 
     async def _fetch(self, index: int, item):
-        """Fetch one item; every fetch failure is the caller's (a terminal 400)."""
+        """Fetch one item, keeping the fetcher's own verdict on whose fault it is.
+
+        A bad URL or unusable media is the caller's and terminal. A timeout, a
+        refused connection or an origin 5xx is not: the same request can
+        succeed elsewhere or later, so it leaves here as retryable.
+        """
         try:
             if item.modality == "image":
                 return await self._connector.fetch_image_async(item.url)
@@ -238,11 +275,11 @@ class InProcessMediaProcessor:
                 return await self._connector.fetch_video_async(
                     item.url, video_processor=self._video_processor
                 )
-        except ValueError:
+        except (self._caller_error, ValueError):
             raise
         except Exception as e:
             logger.warning("media_refs[%d]: fetch failed for %s: %s", index, item.modality, e)
-            raise ValueError(f"media_refs[{index}]: fetch failed: {e}") from e
+            raise MmProcessorUnavailable(f"media_refs[{index}]: fetch failed: {e}") from e
         raise ValueError(f"unsupported media modality {item.modality!r}")
 
 
@@ -346,7 +383,7 @@ class RedisMediaProcessor:
         namespace: str | None = None,
         max_item_bytes: int = DEFAULT_MAX_ITEM_BYTES,
         max_inflight: int = DEFAULT_MAX_INFLIGHT,
-        max_items: int = DEFAULT_MAX_ITEMS,
+        max_items: int | None = None,
         client=None,
     ) -> None:
         self._engine = engine
@@ -354,7 +391,7 @@ class RedisMediaProcessor:
         self._timeout_ms = timeout_ms
         self._max_queue = max_queue
         self._max_item_bytes = max_item_bytes
-        self._max_items = max_items
+        self._item_limits = item_limits(engine.model_config.get_multimodal_config(), max_items)
         self.max_inflight = max_inflight
         self._keys = Keys.for_namespace(resolve_namespace(fingerprint, namespace))
         self._client = client if client is not None else _redis_client(redis_url)
@@ -367,7 +404,9 @@ class RedisMediaProcessor:
     async def probe(self) -> bool:
         """Whether a sidecar with a matching fingerprint is alive."""
         try:
-            hello = await self._client.hgetall(self._keys.hello)
+            hello = await asyncio.wait_for(
+                self._client.hgetall(self._keys.hello), CONTROL_TIMEOUT_S
+            )
         except Exception as e:  # noqa: BLE001 - any transport failure means "not advertised"
             self._log_probe_once("redis unreachable: %s", e)
             return False
@@ -417,7 +456,7 @@ class RedisMediaProcessor:
         *,
         request_id: str = "",
     ):
-        enforce_item_count(items, self._max_items)
+        enforce_item_count(items, self._item_limits)
         enforce_item_bytes(items, self._max_item_bytes)
         now_ms = int(time.time() * 1000)
         job = Job(
@@ -436,15 +475,21 @@ class RedisMediaProcessor:
 
     async def _submit_and_wait(self, job: Job) -> JobResult:
         """Transport only: queue the job and wait for its result."""
+        wait_s = self._timeout_ms / 1000
         try:
-            depth = await self._client.llen(self._keys.jobs)
+            depth = await asyncio.wait_for(self._client.llen(self._keys.jobs), CONTROL_TIMEOUT_S)
             if depth >= self._max_queue:
                 raise MmProcessorUnavailable(
                     f"sidecar_overloaded: {depth} jobs queued (cap {self._max_queue})"
                 )
-            await self._client.lpush(self._keys.jobs, encode_job(job))
-            popped = await self._client.brpop(
-                self._keys.result(job.job_id), timeout=self._timeout_ms / 1000
+            await asyncio.wait_for(
+                self._client.lpush(self._keys.jobs, encode_job(job)), CONTROL_TIMEOUT_S
+            )
+            # Redis stops waiting on its own, but only if it is still answering;
+            # the outer bound is what covers a connection that has gone quiet.
+            popped = await asyncio.wait_for(
+                self._client.brpop(self._keys.result(job.job_id), timeout=wait_s),
+                wait_s + CONTROL_TIMEOUT_S,
             )
         except MmProcessorUnavailable:
             raise
@@ -545,7 +590,7 @@ def build_mm_processor(engine, *, env: Mapping[str, str] = os.environ):
         return None
     max_item_bytes = env_int(env, ENV_MAX_ITEM_BYTES, DEFAULT_MAX_ITEM_BYTES)
     max_inflight = env_int(env, ENV_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT)
-    max_items = env_int(env, ENV_MAX_ITEMS, DEFAULT_MAX_ITEMS)
+    max_items = env_int_opt(env, ENV_MAX_ITEMS)
     if mode == MODE_INPROCESS:
         return InProcessMediaProcessor(
             engine, max_item_bytes=max_item_bytes, max_inflight=max_inflight, max_items=max_items

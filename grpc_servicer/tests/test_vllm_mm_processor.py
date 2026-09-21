@@ -144,6 +144,61 @@ class TestBuildProcessor:
         with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEMS"):
             mm_processor.build_mm_processor(self._Engine(), env=env)
 
+    def test_a_model_the_caller_cannot_anchor_stays_off(self, monkeypatch):
+        monkeypatch.setattr(mm_processor, "anchors_are_placeable", lambda _: False)
+        env = {"SMG_VLLM_MM_PROCESSOR": "inprocess"}
+        assert mm_processor.build_mm_processor(self._Engine(), env=env) is None
+
+
+class TestPlaceableAnchors:
+    """Only a model whose media grows from one fixed token per kind can be fed
+    references: everything else needs its media preprocessed by the caller."""
+
+    class _Replacement:
+        def __init__(self, modality, target):
+            self.modality = modality
+            self.target = target
+
+    class _Insertion:
+        """An update that grows around its anchor instead of over it."""
+
+        def __init__(self, modality, target):
+            self.modality = modality
+            self.target = target
+
+    def placeable(self, updates):
+        return mm_processor._updates_are_placeable(updates, TestPlaceableAnchors._Replacement)
+
+    def test_one_fixed_token_per_kind(self):
+        assert self.placeable([self._Replacement("image", [1]), self._Replacement("video", [2])])
+
+    def test_a_kind_the_model_lacks_is_not_required(self):
+        assert self.placeable([self._Replacement("image", [1])])
+
+    def test_a_mark_numbered_per_item_is_refused(self):
+        assert not self.placeable(
+            [self._Replacement("image", [1]), self._Replacement("image", [2])]
+        )
+
+    def test_a_token_pair_is_refused(self):
+        assert not self.placeable([self._Replacement("image", [1, 2])])
+
+    def test_a_text_anchor_is_refused(self):
+        assert not self.placeable([self._Replacement("image", "<image>")])
+
+    def test_a_positional_anchor_is_refused(self):
+        assert not self.placeable([self._Replacement("image", 0)])
+
+    def test_one_bad_kind_disqualifies_the_worker(self):
+        assert not self.placeable([self._Replacement("image", [1]), self._Insertion("video", [2])])
+
+    def test_a_model_that_grows_no_fetchable_media_is_refused(self):
+        assert not self.placeable([self._Replacement("audio", [1])])
+        assert not self.placeable([])
+
+    def test_a_model_that_cannot_be_read_answers_no(self):
+        assert mm_processor.anchors_are_placeable(object()) is False
+
 
 class TestRedisClient:
     @staticmethod

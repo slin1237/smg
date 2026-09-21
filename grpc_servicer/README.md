@@ -50,7 +50,15 @@ SMG_VLLM_MM_PROCESSOR=inprocess vllm serve Qwen/Qwen3-VL-8B-Instruct --grpc \
 The worker then advertises `mm_processor=inprocess` and `mm_media_ref_schemes`
 through `GetServerInfo`; a router with media-reference support forwards
 `media_refs` only to workers that advertise, and a router without it ignores the
-labels and keeps sending preprocessed tensors. vLLM's `--allowed-media-domains`,
+labels and keeps sending preprocessed tensors.
+
+A worker advertises only for a model whose media vLLM grows from one fixed token
+per kind, which is what lets a caller leave one anchor per item in the prompt.
+Models anchored on a mark numbered per item (Phi-3.5), on a token pair (Qwen-VL
+v1) or on a position cannot be driven that way: the worker logs that it is
+staying off, advertises nothing, and the router keeps preprocessing their media.
+The answer comes from the processor the engine is about to run, so there is no
+list of supported models to keep current. vLLM's `--allowed-media-domains`,
 `--allowed-local-media-path`, `--media-io-kwargs`, `--limit-mm-per-prompt` and
 `VLLM_*_FETCH_TIMEOUT` govern fetching on the worker; without
 `--allowed-media-domains` the worker fetches from any host the router forwards.
@@ -59,18 +67,16 @@ jobs; `SMG_VLLM_MM_MAX_ITEMS` (default 16) caps references per request;
 `SMG_VLLM_MM_MAX_ITEM_BYTES` (default 32 MiB) caps inline `data:` payloads.
 
 On the router side, `SMG_MM_PROCESSING` selects `auto` (default: forward when
-the model's spec opts in and every registered worker of the model advertises
-`mm_processor`), `router` (always preprocess) or `worker` (strict: 400 when a
-request cannot be forwarded); the outcome is counted in
+every registered worker of the model advertises `mm_processor`), `router`
+(always preprocess) or `worker` (strict: 400 when a request cannot be
+forwarded); the outcome is counted in
 `smg_mm_processing_total{model,mode,reason}`. It is read from the router's
 environment only and has no router-config equivalent. Any other value stops the
 router at startup instead of quietly reverting to `auto`. On the worker path the
 router never expands placeholders, so routing decisions that weigh the prompt's token
 count (cache-aware policies, load estimates) see one token per media item where
 the worker will schedule the full placeholder run. The `E2E_MM_PROCESSING=worker`
-e2e lanes run the multimodal suites in this mode, and
-`crates/multimodal/scripts/check_worker_anchor_parity.py` checks that a spec's
-anchor is the token vLLM expands.
+e2e lanes run the multimodal suites in this mode.
 
 To move fetching and processing out of the vLLM process, run the GPU-free
 sidecar next to a private Redis and point the worker at it

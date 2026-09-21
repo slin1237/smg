@@ -223,7 +223,7 @@ pub(crate) async fn prepare_chat_like(
         let mut multimodal_intermediate = None;
         let mut multimodal_refs = None;
         if let (
-            Some(placeholders),
+            Some(_),
             Some((mm_components, model_id, tokenizer_id, tokenizer_source, media_plan)),
         ) = (placeholder_tokens.as_ref(), mm_context)
         {
@@ -232,7 +232,6 @@ pub(crate) async fn prepare_chat_like(
                 &ctx.components.worker_registry,
                 model_id,
                 &media_plan,
-                placeholders,
             )
             .map_err(|e| error::bad_request(e.code(), e.to_string()))?;
             if processing == multimodal::MmProcessing::Worker {

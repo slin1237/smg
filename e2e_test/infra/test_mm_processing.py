@@ -24,18 +24,21 @@ def test_unknown_value_raises(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("lane", "vllm", "expandable", "expected"),
+    ("lane", "vllm", "worker_processes_media", "expected"),
     [
         ("worker", True, True, ("worker", "auto_uniform")),
-        ("worker", True, False, ("router", "model_not_opted_in")),
+        ("worker", True, False, ("router", "auto_incapable")),
         ("worker", False, True, ("router", None)),
         (None, True, True, ("router", None)),
     ],
 )
-def test_expected_path_matrix(monkeypatch, lane, vllm, expandable, expected):
+def test_expected_path_matrix(monkeypatch, lane, vllm, worker_processes_media, expected):
     monkeypatch.setattr(mm_processing, "get_mm_processing", lambda: lane)
     monkeypatch.setattr(mm_processing, "is_vllm", lambda: vllm)
-    assert mm_processing.expected_mm_processing(worker_expandable=expandable) == expected
+    assert (
+        mm_processing.expected_mm_processing(worker_processes_media=worker_processes_media)
+        == expected
+    )
 
 
 def test_parse_samples_reads_labels_and_values():
@@ -44,11 +47,11 @@ def test_parse_samples_reads_labels_and_values():
         "# TYPE smg_mm_processing_total counter\n"
         'smg_mm_processing_total{model="Qwen/Qwen3-VL-8B-Instruct",mode="worker",'
         'reason="auto_uniform"} 3\n'
-        'smg_mm_processing_total{model="m",mode="router",reason="model_not_opted_in"} 1.5\n'
+        'smg_mm_processing_total{model="m",mode="router",reason="auto_incapable"} 1.5\n'
         'smg_requests_total{model="m"} 9\n'
     )
     samples = mm_processing.parse_mm_processing_samples(text)
     assert samples == [
         ({"model": "Qwen/Qwen3-VL-8B-Instruct", "mode": "worker", "reason": "auto_uniform"}, 3.0),
-        ({"model": "m", "mode": "router", "reason": "model_not_opted_in"}, 1.5),
+        ({"model": "m", "mode": "router", "reason": "auto_incapable"}, 1.5),
     ]

@@ -186,12 +186,6 @@ pub trait ModelProcessorSpec: Send + Sync {
         MediaPartOrder::MediaFirst
     }
 
-    /// Whether the anchor rendered for `modality` is exactly the single token
-    /// vLLM's prompt updates target, so a worker can expand it itself.
-    fn worker_expandable(&self, _modality: Modality) -> bool {
-        false
-    }
-
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String>;
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId>;
     fn placeholder_token_for(
@@ -498,12 +492,6 @@ mod tests {
                 modality: Modality::Video,
             }
         );
-    }
-
-    #[test]
-    fn worker_expandable_defaults_to_false() {
-        assert!(!TestSpec.worker_expandable(Modality::Image));
-        assert!(!TestSpec.worker_expandable(Modality::Video));
     }
 
     #[test]

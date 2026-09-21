@@ -351,6 +351,66 @@ def engine_fingerprint(engine) -> Fingerprint:
     return fingerprint_from_model_config(engine.model_config)
 
 
+def _anchor_token(update, replacement_type) -> int | None:
+    """The one token `update` replaces, or None when it is anchored elsewhere."""
+    if not isinstance(update, replacement_type):
+        return None
+    target = getattr(update, "target", None)
+    if isinstance(target, (str, bytes)) or not isinstance(target, Sequence):
+        return None
+    if len(target) != 1 or not isinstance(target[0], int):
+        return None
+    return target[0]
+
+
+def _updates_are_placeable(updates, replacement_type) -> bool:
+    anchors: dict[str, set[int | None]] = {}
+    for update in updates:
+        modality = getattr(update, "modality", None)
+        if modality in FETCHABLE_MODALITIES:
+            anchors.setdefault(modality, set()).add(_anchor_token(update, replacement_type))
+    if not anchors:
+        logger.warning("this model grows no image or video prompt")
+        return False
+    unplaceable = sorted(
+        modality for modality, tokens in anchors.items() if len(tokens) != 1 or None in tokens
+    )
+    if unplaceable:
+        logger.warning("%s is not grown from one fixed token", ", ".join(unplaceable))
+        return False
+    return True
+
+
+def anchors_are_placeable(model_config) -> bool:
+    """Whether a caller can write this model's media anchors itself.
+
+    A caller that sends media references leaves one token per item in the
+    prompt and lets this worker grow it into that item's full run. That works
+    only when every modality is grown from a single fixed token: a model
+    anchored on a mark numbered per item, on a token pair, or on a position has
+    nothing a caller can put there, and its media has to arrive preprocessed.
+
+    Answered by the processor this engine will actually run, so it needs no
+    per-model table and follows vLLM across versions. Anything unreadable
+    answers no, because the cost of guessing wrong is a prompt the model cannot
+    interpret.
+    """
+    try:
+        from vllm.multimodal import MULTIMODAL_REGISTRY
+        from vllm.multimodal.inputs import MultiModalKwargsItems
+        from vllm.multimodal.parse import MultiModalDataItems
+        from vllm.multimodal.processing import PromptReplacement
+
+        processor = MULTIMODAL_REGISTRY.create_processor(model_config)
+        updates = processor._get_prompt_updates(
+            MultiModalDataItems({}), {}, MultiModalKwargsItems({})
+        )
+    except Exception:
+        logger.warning("cannot read this model's prompt updates", exc_info=True)
+        return False
+    return _updates_are_placeable(updates, PromptReplacement)
+
+
 def _cast_floats(data, dtype):
     """Cast floating tensors to the model dtype, as the HF processor path does."""
     import torch
@@ -599,6 +659,15 @@ def build_mm_processor(engine, *, env: Mapping[str, str] = os.environ):
     max_item_bytes = env_int(env, ENV_MAX_ITEM_BYTES, DEFAULT_MAX_ITEM_BYTES)
     max_inflight = env_int(env, ENV_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT)
     max_items = env_int_opt(env, ENV_MAX_ITEMS)
+    # Advertising a backend this model cannot be served through would strand
+    # its media requests; staying off is what keeps the caller preprocessing.
+    if not anchors_are_placeable(model_config):
+        logger.warning(
+            "%s=%s ignored: this model needs its media preprocessed by the caller",
+            ENV_PROCESSOR,
+            mode,
+        )
+        return None
     if mode == MODE_INPROCESS:
         return InProcessMediaProcessor(
             engine, max_item_bytes=max_item_bytes, max_inflight=max_inflight, max_items=max_items

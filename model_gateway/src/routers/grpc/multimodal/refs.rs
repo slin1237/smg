@@ -8,11 +8,7 @@ use llm_multimodal::{media, MediaContentPart, Modality};
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
 
-use super::{
-    capability::runtime_supports_modality,
-    config::MultimodalComponents,
-    plan::{MediaPlan, PlaceholderTokens},
-};
+use super::{capability::runtime_supports_modality, config::MultimodalComponents, plan::MediaPlan};
 use crate::{
     observability::metrics::Metrics,
     routers::grpc::context::WorkerSelection,
@@ -45,8 +41,6 @@ impl MmProcessing {
 pub(crate) enum MmRefsError {
     /// A part carries per-item processing hints the worker cannot honor.
     HintUnsupported,
-    /// The model's placeholder anchor is not one the worker can expand.
-    ModelNotOptedIn(Modality),
     /// vLLM does not accept this modality at all.
     ModalityUnsupported(Modality),
     /// A part kind with no reference form (inline bytes, embeddings, audio).
@@ -70,7 +64,6 @@ impl MmRefsError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::HintUnsupported => "multimodal_hint_unsupported_in_worker_mode",
-            Self::ModelNotOptedIn(_) => "multimodal_worker_processing_unsupported_model",
             Self::ModalityUnsupported(_) | Self::UnsupportedPart(_) => "multimodal_not_supported",
             Self::RefTooLarge { .. } => "media_ref_too_large",
             Self::SchemeNotAccepted { .. } => "media_ref_scheme_not_accepted",
@@ -84,10 +77,6 @@ impl std::fmt::Display for MmRefsError {
         match self {
             Self::HintUnsupported => f.write_str(
                 "per-item media hints (max_long_side_pixel, fps) cannot be forwarded to a worker",
-            ),
-            Self::ModelNotOptedIn(modality) => write!(
-                f,
-                "this model's {modality} placeholder is not expandable by a vLLM worker"
             ),
             Self::ModalityUnsupported(modality) => {
                 write!(f, "vLLM workers do not accept {modality} inputs")
@@ -146,16 +135,10 @@ pub(crate) fn worker_media_ref_schemes(worker: &dyn Worker) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-fn ensure_worker_expandable(
-    plan: &MediaPlan,
-    placeholders: &PlaceholderTokens,
-) -> Result<(), MmRefsError> {
+fn ensure_modalities_supported(plan: &MediaPlan) -> Result<(), MmRefsError> {
     for &modality in plan.modalities() {
         if !runtime_supports_modality(RuntimeType::Vllm, modality) {
             return Err(MmRefsError::ModalityUnsupported(modality));
-        }
-        if !placeholders.worker_expandable(modality) {
-            return Err(MmRefsError::ModelNotOptedIn(modality));
         }
     }
     Ok(())
@@ -168,7 +151,6 @@ pub(crate) fn resolve_mm_processing(
     registry: &WorkerRegistry,
     model_id: &str,
     plan: &MediaPlan,
-    placeholders: &PlaceholderTokens,
 ) -> Result<MmProcessing, MmRefsError> {
     let (resolved, reason) = match components.processing {
         MmProcessingMode::Router => (MmProcessing::Router, "config"),
@@ -176,27 +158,27 @@ pub(crate) fn resolve_mm_processing(
             if let Some(blocker) = refs_blocker(plan) {
                 return Err(blocker);
             }
-            ensure_worker_expandable(plan, placeholders)?;
+            ensure_modalities_supported(plan)?;
             (MmProcessing::Worker, "config")
         }
         MmProcessingMode::Auto => {
             if !plan.is_forwardable() {
                 (MmProcessing::Router, "plan_not_forwardable")
-            } else if ensure_worker_expandable(plan, placeholders).is_err() {
-                (MmProcessing::Router, "model_not_opted_in")
+            } else if ensure_modalities_supported(plan).is_err() {
+                (MmProcessing::Router, "modality_unsupported")
             } else {
                 // Every registered worker, healthy or not: a health flap must
                 // not flip a model between modes request to request.
                 let workers = registry.get_by_model(model_id);
-                if workers.is_empty() {
-                    (MmProcessing::Router, "auto_none")
-                } else if workers
+                let capable = workers
                     .iter()
-                    .all(|worker| worker_accepts_media_refs(worker.as_ref()))
-                {
-                    (MmProcessing::Worker, "auto_uniform")
-                } else {
-                    (MmProcessing::Router, "auto_mixed")
+                    .filter(|worker| worker_accepts_media_refs(worker.as_ref()))
+                    .count();
+                match capable {
+                    _ if workers.is_empty() => (MmProcessing::Router, "auto_none"),
+                    0 => (MmProcessing::Router, "auto_incapable"),
+                    n if n == workers.len() => (MmProcessing::Worker, "auto_uniform"),
+                    _ => (MmProcessing::Router, "auto_mixed"),
                 }
             }
         }
@@ -385,13 +367,6 @@ mod tests {
         MediaPlan::new(parts)
     }
 
-    fn expandable_placeholders() -> PlaceholderTokens {
-        let mut placeholders = PlaceholderTokens::default();
-        placeholders.insert(Modality::Image, "<|image_pad|>".to_string());
-        placeholders.set_worker_expandable(Modality::Image, true);
-        placeholders
-    }
-
     fn components(mode: MmProcessingMode) -> MultimodalComponents {
         let mut components =
             MultimodalComponents::new(Arc::new(MultimodalConfigRegistry::new()), None, None)
@@ -509,7 +484,6 @@ mod tests {
             &registry,
             MODEL,
             &plan(vec![image_url("https://a/1.png")]),
-            &expandable_placeholders(),
         )
         .expect("router mode resolves");
         assert_eq!(resolved, MmProcessing::Router);
@@ -517,7 +491,6 @@ mod tests {
 
     #[test]
     fn auto_forwards_only_for_a_uniform_capable_fleet() {
-        let placeholders = expandable_placeholders();
         let plan_ok = plan(vec![image_url("https://a/1.png")]);
         let components = components(MmProcessingMode::Auto);
 
@@ -526,8 +499,7 @@ mod tests {
             capable("grpc://127.0.0.1:9401"),
         ]);
         assert_eq!(
-            resolve_mm_processing(&components, &uniform, MODEL, &plan_ok, &placeholders)
-                .expect("resolves"),
+            resolve_mm_processing(&components, &uniform, MODEL, &plan_ok).expect("resolves"),
             MmProcessing::Worker
         );
 
@@ -541,21 +513,32 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            resolve_mm_processing(&components, &mixed, MODEL, &plan_ok, &placeholders)
-                .expect("resolves"),
+            resolve_mm_processing(&components, &mixed, MODEL, &plan_ok).expect("resolves"),
+            MmProcessing::Router
+        );
+
+        // A fleet where no worker does its own media processing is the ordinary
+        // case, not a mixed one.
+        let none_capable = registry_with(vec![worker(
+            "grpc://127.0.0.1:9404",
+            RuntimeType::Vllm,
+            ConnectionMode::Grpc,
+            &[],
+        )]);
+        assert_eq!(
+            resolve_mm_processing(&components, &none_capable, MODEL, &plan_ok).expect("resolves"),
             MmProcessing::Router
         );
 
         let empty = registry_with(vec![]);
         assert_eq!(
-            resolve_mm_processing(&components, &empty, MODEL, &plan_ok, &placeholders)
-                .expect("resolves"),
+            resolve_mm_processing(&components, &empty, MODEL, &plan_ok).expect("resolves"),
             MmProcessing::Router
         );
     }
 
     #[test]
-    fn auto_falls_back_for_hints_and_unopted_models() {
+    fn auto_falls_back_for_per_item_hints() {
         let components = components(MmProcessingMode::Auto);
         let registry = registry_with(vec![capable("grpc://127.0.0.1:9500")]);
 
@@ -566,28 +549,7 @@ mod tests {
             max_long_side_pixel: Some(512),
         }]);
         assert_eq!(
-            resolve_mm_processing(
-                &components,
-                &registry,
-                MODEL,
-                &hinted,
-                &expandable_placeholders()
-            )
-            .expect("resolves"),
-            MmProcessing::Router
-        );
-
-        let mut unopted = PlaceholderTokens::default();
-        unopted.insert(Modality::Image, "<|image|>".to_string());
-        assert_eq!(
-            resolve_mm_processing(
-                &components,
-                &registry,
-                MODEL,
-                &plan(vec![image_url("https://a/1.png")]),
-                &unopted
-            )
-            .expect("resolves"),
+            resolve_mm_processing(&components, &registry, MODEL, &hinted).expect("resolves"),
             MmProcessing::Router
         );
     }
@@ -602,24 +564,11 @@ mod tests {
                 &components,
                 &registry,
                 MODEL,
-                &plan(vec![image_url("https://a/1.png")]),
-                &expandable_placeholders()
+                &plan(vec![image_url("https://a/1.png")])
             )
             .expect("resolves"),
             MmProcessing::Worker
         );
-
-        let mut unopted = PlaceholderTokens::default();
-        unopted.insert(Modality::Image, "<|image|>".to_string());
-        let err = resolve_mm_processing(
-            &components,
-            &registry,
-            MODEL,
-            &plan(vec![image_url("https://a/1.png")]),
-            &unopted,
-        )
-        .expect_err("unopted model is refused");
-        assert_eq!(err.code(), "multimodal_worker_processing_unsupported_model");
 
         let hinted = plan(vec![MediaContentPart::VideoUrl {
             url: "https://a/c.mp4".to_string(),
@@ -627,14 +576,8 @@ mod tests {
             fps: Some(2.0),
             max_long_side_pixel: None,
         }]);
-        let err = resolve_mm_processing(
-            &components,
-            &registry,
-            MODEL,
-            &hinted,
-            &expandable_placeholders(),
-        )
-        .expect_err("hints are refused");
+        let err = resolve_mm_processing(&components, &registry, MODEL, &hinted)
+            .expect_err("hints are refused");
         assert_eq!(err.code(), "multimodal_hint_unsupported_in_worker_mode");
 
         let inline = plan(vec![MediaContentPart::ImageData {
@@ -643,14 +586,8 @@ mod tests {
             uuid: None,
             detail: None,
         }]);
-        let err = resolve_mm_processing(
-            &components,
-            &registry,
-            MODEL,
-            &inline,
-            &expandable_placeholders(),
-        )
-        .expect_err("inline bytes are refused by name");
+        let err = resolve_mm_processing(&components, &registry, MODEL, &inline)
+            .expect_err("inline bytes are refused by name");
         assert_eq!(err, MmRefsError::UnsupportedPart("inline image bytes"));
     }
 

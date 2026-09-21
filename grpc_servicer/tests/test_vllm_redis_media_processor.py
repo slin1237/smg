@@ -311,6 +311,7 @@ class TestBuild:
     def test_redis_mode_builds_processor(self, monkeypatch):
         monkeypatch.setattr(mm_processor, "engine_fingerprint", lambda engine: fingerprint())
         monkeypatch.setattr(mm_processor, "_redis_client", lambda url: FakeRedis())
+        monkeypatch.setattr(mm_processor, "anchors_are_placeable", lambda _: True)
         env = {
             "SMG_VLLM_MM_PROCESSOR": "redis",
             "SMG_VLLM_MM_SIDECAR_TIMEOUT_MS": "1000",

@@ -135,7 +135,7 @@ class TestMultimodalQwen3VL:
         )
         assert response.choices[0].message.content
         # Qwen3-VL's <|image_pad|> anchor is one a vLLM worker expands itself.
-        assert_mm_processing(gateway, worker_expandable=True)
+        assert_mm_processing(gateway, worker_processes_media=True)
 
     def test_multi_images_mixed(self, model, setup_backend):
         """Test multiple images with mixed base64 and URL inputs, including duplicates."""

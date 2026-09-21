@@ -26,23 +26,23 @@ def mm_processing_samples(gateway) -> list[tuple[dict[str, str], float]]:
     return parse_mm_processing_samples(response.text)
 
 
-def expected_mm_processing(*, worker_expandable: bool) -> tuple[str, str | None]:
+def expected_mm_processing(*, worker_processes_media: bool) -> tuple[str, str | None]:
     """The (mode, reason) the gateway must record for this lane and model.
 
-    Only vLLM gRPC workers advertise worker-side processing, and only models
-    whose placeholder anchor a vLLM worker can expand take the worker path;
-    every other combination stays on the router path.
+    Only vLLM gRPC workers advertise worker-side processing, and a worker only
+    advertises for a model whose media it can grow from the anchors the router
+    writes; every other combination stays on the router path.
     """
     if get_mm_processing() == MM_PROCESSING_WORKER and is_vllm():
-        if worker_expandable:
+        if worker_processes_media:
             return "worker", "auto_uniform"
-        return "router", "model_not_opted_in"
+        return "router", "auto_incapable"
     return "router", None
 
 
-def assert_mm_processing(gateway, *, worker_expandable: bool) -> None:
+def assert_mm_processing(gateway, *, worker_processes_media: bool) -> None:
     """Every multimodal request this gateway served took the lane's expected path."""
-    mode, reason = expected_mm_processing(worker_expandable=worker_expandable)
+    mode, reason = expected_mm_processing(worker_processes_media=worker_processes_media)
     samples = [(labels, value) for labels, value in mm_processing_samples(gateway) if value > 0]
     assert samples, f"gateway recorded no {MM_PROCESSING_METRIC} samples"
     modes = {labels["mode"] for labels, _ in samples}

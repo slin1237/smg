@@ -111,7 +111,7 @@ class TestPDMultimodalKvIsolation:
     def test_different_images_same_prefix_do_not_alias(self, setup_backend):
         backend, model, client, gateway = setup_backend
         _assert_no_cross_image_aliasing(client, model)
-        assert_mm_processing(gateway, worker_expandable=False)
+        assert_mm_processing(gateway, worker_processes_media=False)
 
 
 @pytest.mark.engine("vllm")
@@ -130,7 +130,7 @@ class TestPDMultimodalMrope:
     def test_mrope_decode_answers_and_does_not_alias(self, setup_backend):
         backend, model, client, gateway = setup_backend
         _assert_no_cross_image_aliasing(client, model)
-        assert_mm_processing(gateway, worker_expandable=True)
+        assert_mm_processing(gateway, worker_processes_media=True)
 
     def test_parallel_sampling_keeps_vision_on_decode(self, setup_backend):
         # n>1 skips the KV handoff, so the decode leg recomputes the prompt

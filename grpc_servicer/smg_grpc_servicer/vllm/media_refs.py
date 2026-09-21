@@ -8,8 +8,8 @@ from urllib.parse import urlsplit
 
 from smg_grpc_proto.generated import common_pb2
 
-# Modalities the worker can process from a reference. Audio is excluded until a
-# router spec opts in and an e2e model exists.
+# Modalities the worker can process from a reference. Audio is excluded until
+# the router can send it this way and an e2e model exists.
 _MODALITY_NAMES: dict[int, str] = {
     common_pb2.IMAGE: "image",
     common_pb2.VIDEO: "video",

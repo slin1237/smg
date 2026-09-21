@@ -47,6 +47,8 @@ JOB_WAIT_S = 5
 JOB_WAIT_MARGIN_S = 2
 # How long a worker holds off after a refused or unanswered wait.
 RECONNECT_PAUSE_S = 1
+# The least time a finished job's answer gets to reach the requester.
+PUSH_FLOOR_S = 5
 
 
 def build_config(args: argparse.Namespace):
@@ -140,11 +142,13 @@ class Sidecar:
         }
         while True:
             try:
-                # One transaction: a hello can never outlive its TTL.
+                # One transaction: a hello can never outlive its TTL. The TTL
+                # is also the longest this is worth waiting on, since a refresh
+                # that lands later than that has already lapsed.
                 pipe = self._client.pipeline(transaction=True)
                 pipe.hset(self._keys.hello, mapping=mapping)
                 pipe.expire(self._keys.hello, HELLO_TTL_S)
-                await pipe.execute()
+                await asyncio.wait_for(pipe.execute(), HELLO_TTL_S)
             except Exception as e:  # noqa: BLE001 - keep advertising through redis blips
                 logger.warning("hello refresh failed: %s", e)
             await asyncio.sleep(HELLO_REFRESH_S)
@@ -186,9 +190,24 @@ class Sidecar:
                 pipe = self._client.pipeline(transaction=True)
                 pipe.lpush(key, encode_result(result))
                 pipe.expire(key, RESULT_TTL_S)
-                await pipe.execute()
+                # An answer is worth only as long as the requester is still
+                # waiting for it, and this push carries the whole payload, so
+                # it gets the time the job has left and no more. Unbounded, a
+                # worker that lands on a stalled connection is gone for good
+                # while the sidecar goes on advertising it.
+                await asyncio.wait_for(pipe.execute(), self._push_budget(job))
             except Exception as e:  # noqa: BLE001 - the servicer times out and retries
                 logger.warning("worker %d: result push failed for %s: %s", index, job.job_id, e)
+
+    @staticmethod
+    def _push_budget(job: Job) -> float:
+        """Seconds left before the requester gives up, never less than a moment.
+
+        A job already past its deadline still gets an attempt: the answer may
+        be a failure code, and delivering it ends the wait sooner than letting
+        it lapse.
+        """
+        return max(PUSH_FLOOR_S, job.deadline_ms / 1000 - time.time())
 
     async def handle(self, job: Job) -> JobResult:
         started = time.time()
@@ -284,7 +303,15 @@ async def serve(args: argparse.Namespace) -> None:
 
     vllm_config = build_config(args)
     renderer = renderer_from_config(vllm_config)
-    client = redis_asyncio.from_url(args.redis_url, decode_responses=False)
+    # No read deadline of the client's own: waiting for the next job is meant
+    # to sit on the socket for JOB_WAIT_S, and a client-wide deadline at or
+    # under that turns every quiet stretch into a failed wait. The caller
+    # bounds each call instead. redis 8 made this explicit by starting to
+    # default it to five seconds. Reaching the server in the first place is a
+    # different question and stays bounded: there is nothing to wait for yet.
+    client = redis_asyncio.from_url(
+        args.redis_url, decode_responses=False, socket_connect_timeout=1.0, socket_timeout=None
+    )
     sidecar = Sidecar(
         vllm_config, renderer, client, namespace=args.namespace, concurrency=args.concurrency
     )

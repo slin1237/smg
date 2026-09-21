@@ -55,6 +55,21 @@ class FakeRedis:
         raise asyncio.CancelledError
 
 
+def stall_the_first_transaction(client):
+    """Make the client's first transaction never answer; returns the stall flag."""
+    stalled = []
+
+    class Stalls(FakePipeline):
+        async def execute(self):
+            if not stalled:
+                stalled.append(True)
+                await asyncio.sleep(3600)
+            return await super().execute()
+
+    client.pipeline = lambda transaction=True: Stalls(client)
+    return stalled
+
+
 def fingerprint():
     return proto.Fingerprint(
         model="m",
@@ -323,6 +338,32 @@ class TestWorkerLoop:
         assert client.hung == 1
         assert served == ["j4"], "the worker came back and served the next job"
 
+    def test_a_stalled_result_push_does_not_take_the_worker_with_it(self, monkeypatch):
+        client = FakeRedis(jobs=[job("j5"), job("j6")])
+        stalled = stall_the_first_transaction(client)
+        s = sidecar(client)
+        served = []
+
+        async def handle(j):
+            served.append(j.job_id)
+            return proto.JobResult(v=1, job_id=j.job_id, ok=True)
+
+        monkeypatch.setattr(s, "handle", handle)
+        monkeypatch.setattr(s, "_push_budget", lambda _job: 0.01)
+        with pytest.raises(asyncio.CancelledError):
+            run(s._worker(0))
+        assert stalled, "the first push hung"
+        assert served == ["j5", "j6"], "the worker came back and served the next job"
+
+    def test_the_push_budget_is_what_the_job_has_left(self):
+        pending = job("j7")
+        pending.deadline_ms = int(time.time() * 1000) + 30_000
+        assert 25 < mm_sidecar.Sidecar._push_budget(pending) <= 30
+
+        lapsed = job("j8")
+        lapsed.deadline_ms = int(time.time() * 1000) - 60_000
+        assert mm_sidecar.Sidecar._push_budget(lapsed) == mm_sidecar.PUSH_FLOOR_S
+
     def test_result_push_is_one_transaction(self, monkeypatch):
         client = FakeRedis(jobs=[job("j3")])
         s = sidecar(client)
@@ -358,6 +399,25 @@ class TestHeartbeat:
         assert ops[0][2]["model"] == "m"
         assert ops[1] == ("expire", s._keys.hello, proto.HELLO_TTL_S)
 
+    def test_heartbeat_survives_a_stalled_refresh(self, monkeypatch):
+        client = FakeRedis()
+        stalled = stall_the_first_transaction(client)
+        s = sidecar(client)
+        monkeypatch.setattr(mm_sidecar, "HELLO_REFRESH_S", 0)
+        monkeypatch.setattr(mm_sidecar, "HELLO_TTL_S", 0.01)
+
+        async def stop_after_two():
+            task = asyncio.ensure_future(s._heartbeat())
+            while len(client.executed) < 2:
+                await asyncio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        run(stop_after_two())
+        assert stalled, "the first refresh hung"
+        assert len(client.executed) >= 2, "the heartbeat came back and refreshed again"
+
     def test_heartbeat_survives_a_failed_refresh(self, monkeypatch):
         client = FakeRedis()
         client.execute_fail = ConnectionError("redis down")
@@ -374,3 +434,47 @@ class TestHeartbeat:
 
         run(stop_after_two())
         assert len(client.executed) >= 2
+
+
+class TestServe:
+    """The entrypoint builds the client that actually runs in a deployment."""
+
+    @staticmethod
+    def _stub(monkeypatch):
+        seen = {}
+
+        def module(name, **attrs):
+            mod = types.ModuleType(name)
+            mod.__dict__.update(attrs)
+            monkeypatch.setitem(sys.modules, name, mod)
+            return mod
+
+        redis_asyncio = module("redis.asyncio", from_url=lambda url, **kw: seen.update(kw))
+        module("redis", asyncio=redis_asyncio)
+        module("vllm")
+        module("vllm.renderers")
+        module("vllm.renderers.registry", renderer_from_config=lambda config: object())
+
+        async def returns_at_once():
+            return None
+
+        monkeypatch.setattr(mm_sidecar, "build_config", lambda args: object())
+        monkeypatch.setattr(
+            mm_sidecar, "Sidecar", lambda *a, **kw: types.SimpleNamespace(run=returns_at_once)
+        )
+        return seen
+
+    def _serve(self, monkeypatch):
+        seen = self._stub(monkeypatch)
+        args = types.SimpleNamespace(
+            redis_url="redis://cache:6379/0", namespace="ns", concurrency=2
+        )
+        run(mm_sidecar.serve(args))
+        return seen
+
+    def test_waiting_for_a_job_has_no_read_deadline(self, monkeypatch):
+        # The wait for the next job is meant to sit on the socket for JOB_WAIT_S.
+        assert self._serve(monkeypatch)["socket_timeout"] is None
+
+    def test_reaching_the_server_still_gives_up(self, monkeypatch):
+        assert self._serve(monkeypatch)["socket_connect_timeout"] == 1.0

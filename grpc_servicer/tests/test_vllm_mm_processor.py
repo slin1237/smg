@@ -6,6 +6,7 @@ Run with: pytest grpc_servicer/tests/test_vllm_mm_processor.py
 import asyncio
 import importlib.util
 import sys
+import types
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -142,6 +143,36 @@ class TestBuildProcessor:
         env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_ITEMS": "-1"}
         with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEMS"):
             mm_processor.build_mm_processor(self._Engine(), env=env)
+
+
+class TestRedisClient:
+    @staticmethod
+    def _stub(monkeypatch):
+        calls = {}
+        asyncio_mod = types.ModuleType("redis.asyncio")
+        asyncio_mod.from_url = lambda url, **kwargs: calls.setdefault("kwargs", kwargs)
+        redis_mod = types.ModuleType("redis")
+        redis_mod.asyncio = asyncio_mod
+        monkeypatch.setitem(sys.modules, "redis", redis_mod)
+        monkeypatch.setitem(sys.modules, "redis.asyncio", asyncio_mod)
+        return calls
+
+    def test_reads_have_no_deadline_of_their_own(self, monkeypatch):
+        calls = self._stub(monkeypatch)
+        mm_processor._redis_client("redis://127.0.0.1:6379")
+        # Redis 8 defaults this to five seconds, which is shorter than the waits
+        # this client is built to make; the caller bounds each call instead.
+        assert calls["kwargs"]["socket_timeout"] is None
+
+    def test_connecting_still_gives_up(self, monkeypatch):
+        calls = self._stub(monkeypatch)
+        mm_processor._redis_client("redis://127.0.0.1:6379")
+        assert calls["kwargs"]["socket_connect_timeout"] == 1.0
+
+    def test_a_missing_client_names_the_extra(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "redis", None)
+        with pytest.raises(ValueError, match="vllm-redis"):
+            mm_processor._redis_client("redis://127.0.0.1:6379")
 
 
 def run(coro):

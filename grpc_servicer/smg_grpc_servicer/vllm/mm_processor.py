@@ -576,7 +576,15 @@ def _redis_client(redis_url: str):
             "pip install smg-grpc-servicer[vllm,vllm-redis]"
         ) from e
 
-    return redis_asyncio.from_url(redis_url, decode_responses=False, socket_connect_timeout=1.0)
+    # No read deadline of the client's own. Every call here is already bounded
+    # by the caller, against the wait that call actually asked for, and a
+    # client-wide deadline cannot know that number: waiting for a result runs
+    # as long as the configured job timeout, so a shorter one would abandon
+    # every job that outlives it and report the sidecar as unreachable.
+    # redis 8 made this explicit by starting to default it to five seconds.
+    return redis_asyncio.from_url(
+        redis_url, decode_responses=False, socket_connect_timeout=1.0, socket_timeout=None
+    )
 
 
 def build_mm_processor(engine, *, env: Mapping[str, str] = os.environ):

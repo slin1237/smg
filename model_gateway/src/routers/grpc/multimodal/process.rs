@@ -15,6 +15,7 @@ use llm_multimodal::{
     VisionProcessorRegistry,
 };
 use llm_tokenizer::TokenizerTrait;
+use rayon::prelude::*;
 use tracing::{debug, info, warn};
 
 use super::{
@@ -458,8 +459,11 @@ async fn preprocess_modality(
                     .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"))
             };
 
+            // Clips are independent until the concat below, and each one is
+            // frames' worth of work, so they go wide the way the image batch
+            // does. `collect` keeps request order, which the concat relies on.
             let parts = videos
-                .iter()
+                .par_iter()
                 .map(|video| preprocess_clip(video))
                 .collect::<Result<Vec<_>>>()?;
             PreprocessedEncoderInputs::concat(parts, &video_layouts)

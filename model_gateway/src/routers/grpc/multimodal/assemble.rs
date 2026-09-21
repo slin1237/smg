@@ -250,15 +250,16 @@ fn ensure_client_supports_intermediate(
 fn assemble_sglang(
     intermediate: PrecomputedMultimodalIntermediate,
 ) -> Result<SglangMultimodalData> {
-    // Pinned to float32. An SGLang worker reads a dtype it does not recognise as
-    // float32 anyway, so a narrower width would be misread as numbers rather
-    // than refused, and nothing on this wire reports which widths it accepts.
+    // Pinned to float32: nothing on this wire reports which widths the worker
+    // accepts, and the three names it does document are all four bytes or wider.
     let (pixel_values, pixel_values_shape, pixel_values_dtype) =
         serialize_encoder_input(&intermediate.preprocessed, "float32");
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
     let MediaBatch::Images(images) = &intermediate.media else {
         anyhow::bail!("SGLang assembly requires an image batch");
     };
+    // Sent alongside the preprocessed tensors: a worker that does its own
+    // preprocessing has nothing else to work from.
     let image_data = images.iter().map(|f| f.raw_bytes.to_vec()).collect();
     let mm_placeholders = placeholders_for_bindings(&intermediate.bindings, true)?;
 

@@ -583,7 +583,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         request_ids = request.request_ids
         logger.info("Abort requests: %s", request_ids)
 
-        await self.engine.abort(request_ids)
+        try:
+            await self.engine.abort(request_ids)
+        except Exception as e:
+            code = grpc_code_for(e)
+            if code is grpc.StatusCode.INTERNAL:
+                logger.exception("Abort failed for requests %s", request_ids)
+            else:
+                logger.warning("Abort rejected (%s) for requests %s: %s", code.name, request_ids, e)
+            await context.abort(code, str(e))
         return vllm_engine_pb2.AbortResponse()
 
     async def GetModelInfo(

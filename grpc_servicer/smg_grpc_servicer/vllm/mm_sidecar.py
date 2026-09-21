@@ -40,6 +40,14 @@ from smg_grpc_servicer.vllm.mm_processor import fingerprint_from_model_config
 
 logger = logging.getLogger("smg_grpc_servicer.vllm.mm_sidecar")
 
+# How long a worker waits for the next job before looking again.
+JOB_WAIT_S = 5
+# The margin on top of that before the wait is treated as a dead connection
+# rather than an empty queue.
+JOB_WAIT_MARGIN_S = 2
+# How long a worker holds off after a refused or unanswered wait.
+RECONNECT_PAUSE_S = 1
+
 
 def build_config(args: argparse.Namespace):
     """vLLM config for preprocessing only: no quantized kernels, no KV cache."""
@@ -144,10 +152,21 @@ class Sidecar:
     async def _worker(self, index: int) -> None:
         while True:
             try:
-                popped = await self._client.brpop(self._keys.jobs, timeout=5)
+                # Redis gives up on its own, but only while it is still
+                # answering. Without the outer bound a connection that goes
+                # quiet takes this worker with it, and a sidecar whose workers
+                # are all gone keeps advertising itself as ready.
+                popped = await asyncio.wait_for(
+                    self._client.brpop(self._keys.jobs, timeout=JOB_WAIT_S),
+                    JOB_WAIT_S + JOB_WAIT_MARGIN_S,
+                )
+            except TimeoutError:
+                logger.warning("worker %d: redis stopped answering; reconnecting", index)
+                await asyncio.sleep(RECONNECT_PAUSE_S)
+                continue
             except Exception as e:  # noqa: BLE001 - reconnect on the next iteration
                 logger.warning("worker %d: brpop failed: %s", index, e)
-                await asyncio.sleep(1)
+                await asyncio.sleep(RECONNECT_PAUSE_S)
                 continue
             if popped is None:
                 continue

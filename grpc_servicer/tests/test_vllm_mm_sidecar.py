@@ -294,6 +294,35 @@ class TestWorkerLoop:
         assert first[1] == ("expire", s._keys.result("j1"), proto.RESULT_TTL_S)
         assert proto.decode_result(second[0][2]).ok
 
+    def test_a_silent_redis_does_not_take_the_worker_with_it(self, monkeypatch):
+        class Hangs(FakeRedis):
+            def __init__(self, jobs=()):
+                super().__init__(jobs)
+                self.hung = 0
+
+            async def brpop(self, key, timeout=0):
+                if self.hung == 0:
+                    self.hung += 1
+                    await asyncio.sleep(3600)
+                return await super().brpop(key, timeout)
+
+        client = Hangs(jobs=[job("j4")])
+        s = sidecar(client)
+        monkeypatch.setattr(mm_sidecar, "JOB_WAIT_S", 0.01)
+        monkeypatch.setattr(mm_sidecar, "JOB_WAIT_MARGIN_S", 0.01)
+        monkeypatch.setattr(mm_sidecar, "RECONNECT_PAUSE_S", 0)
+        served = []
+
+        async def handle(j):
+            served.append(j.job_id)
+            return proto.JobResult(v=1, job_id=j.job_id, ok=True)
+
+        monkeypatch.setattr(s, "handle", handle)
+        with pytest.raises(asyncio.CancelledError):
+            run(s._worker(0))
+        assert client.hung == 1
+        assert served == ["j4"], "the worker came back and served the next job"
+
     def test_result_push_is_one_transaction(self, monkeypatch):
         client = FakeRedis(jobs=[job("j3")])
         s = sidecar(client)

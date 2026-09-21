@@ -172,15 +172,37 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # loop, whether it fetches the media itself or converts tensors the
         # router already prepared. Both are sized by the same setting, so a
         # worker's memory ceiling does not depend on which path a request takes.
-        self._mm_inflight = asyncio.Semaphore(
+        self._mm_limit = (
             self._mm_processor.max_inflight
             if self._mm_processor is not None
             else env_int(os.environ, ENV_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT)
         )
+        self._mm_inflight = asyncio.Semaphore(self._mm_limit)
+        self._mm_waiting = 0
+        self._unhealthy_logged = False
         logger.info(
             "VllmEngineServicer initialized (mm_processor=%s)",
             self._mm_processor.name if self._mm_processor is not None else "off",
         )
+
+    async def _acquire_mm_slot(self) -> None:
+        """Take one multimodal slot, shedding load instead of queueing forever.
+
+        Once as many requests are waiting as the worker can run at once, the
+        ones behind them will not be reached before their callers give up. A
+        retryable refusal now sends them to a worker that can take them, rather
+        than a deadline later that tells the caller nothing about where to go.
+        """
+        if self._mm_waiting >= self._mm_limit:
+            raise MmProcessorUnavailable(
+                f"worker is saturated: {self._mm_limit} multimodal requests in flight "
+                f"and as many waiting"
+            )
+        self._mm_waiting += 1
+        try:
+            await self._mm_inflight.acquire()
+        finally:
+            self._mm_waiting -= 1
 
     async def _off_the_event_loop(self, work, *args):
         """Run one piece of blocking multimodal work under the in-flight cap.
@@ -190,7 +212,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         A caller that goes away while the work is still running therefore does
         not let the next one start against memory that is still held.
         """
-        await self._mm_inflight.acquire()
+        await self._acquire_mm_slot()
         running = asyncio.ensure_future(asyncio.to_thread(work, *args))
         # Kept so the callback below can tell whether a caller is still waiting.
         shielded = asyncio.shield(running)
@@ -275,7 +297,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     )
                 items = parse_media_refs(request.media_refs)
                 validate_schemes(items, self._mm_processor.accepted_schemes)
-                async with self._mm_inflight:
+                await self._acquire_mm_slot()
+                try:
                     prompt = await self._mm_processor.process(
                         list(request.tokenized.input_ids),
                         request.tokenized.original_text or None,
@@ -283,6 +306,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                         arrival_time,
                         request_id=request_id,
                     )
+                finally:
+                    self._mm_inflight.release()
             elif has_preprocessed_mm and input_type == "tokenized":
                 # A pixel-less payload (PD decode leg) is only decodable with
                 # remote KV: a local recompute would schedule the vision
@@ -393,6 +418,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                             num_prompt_logprobs=num_prompt_logprobs,
                         )
 
+        except asyncio.CancelledError:
+            # A caller that gives up while media is still being fetched leaves
+            # the same blocks pinned as any other pre-admission failure, and the
+            # cleanup has to outlive a second cancellation to land.
+            await asyncio.shield(
+                self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
+            )
+            raise
         except MmProcessorUnavailable as e:
             # Retryable: the router re-selects a worker on UNAVAILABLE.
             logger.warning("Media processing unavailable for request %s: %s", request_id, e)
@@ -516,7 +549,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         is_healthy = not self.engine.errored
         message = "Health" if is_healthy else "Engine is not alive"
 
-        logger.info("HealthCheck request: healthy=%s, message=%s", is_healthy, message)
+        # Probes arrive on a fixed interval and the answer is engine state the
+        # caller already receives, so only the turn for the worse is worth a
+        # line, and only the first one: the engine does not come back.
+        if not is_healthy and not self._unhealthy_logged:
+            self._unhealthy_logged = True
+            logger.error("HealthCheck is now reporting unhealthy: %s", message)
 
         return vllm_engine_pb2.HealthCheckResponse(healthy=is_healthy, message=message)
 
@@ -726,15 +764,16 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # For now, GetTokenizer only works when vLLM is started with a local path.
         tokenizer_dir = Path(tokenizer_path)
 
-        # Build ZIP archive in memory
+        # Reading and compressing the tokenizer directory is file I/O and CPU
+        # measured in hundreds of milliseconds, so it stays off the event loop
+        # and the engine keeps answering everything else meanwhile.
         try:
-            zip_buffer = build_tokenizer_zip(tokenizer_dir)
+            zip_buffer, sha256 = await asyncio.to_thread(self._tokenizer_bundle, tokenizer_dir)
         except Exception as e:
             logger.exception("Failed to build tokenizer ZIP")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
         zip_data = zip_buffer.getbuffer()
-        sha256 = hashlib.sha256(zip_data).hexdigest()
 
         logger.info(
             "Streaming tokenizer bundle: %d bytes, sha256=%s",
@@ -755,6 +794,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             offset = end
 
     # ========== Helper methods ==========
+
+    @staticmethod
+    def _tokenizer_bundle(tokenizer_dir: Path):
+        """The tokenizer archive and its fingerprint, built in one pass."""
+        zip_buffer = build_tokenizer_zip(tokenizer_dir)
+        return zip_buffer, hashlib.sha256(zip_buffer.getbuffer()).hexdigest()
 
     def _build_preprocessed_mm_inputs(
         self,
